@@ -1,0 +1,18 @@
+CompileFlags:
+  Add: [-std=c++20]
+
+Diagnostics:
+  ClangTidy:
+    Add: [
+      bugprone-*,
+      performance-*,
+      modernize-*,
+      readability-*,
+      clang-analyzer-*
+    ]
+
+Index:
+  Background: Build
+
+Completion:
+  AllScopes: true

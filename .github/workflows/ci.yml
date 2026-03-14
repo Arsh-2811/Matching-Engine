@@ -1,0 +1,81 @@
+name: C++ CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y ninja-build
+          sudo apt install -y \
+            build-essential \
+            cmake \
+            clang \
+            clang-tidy \
+            clang-format
+
+      - name: Configure
+        run: cmake -S . -B build -G Ninja
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Run tests
+        run: cd build && ctest --output-on-failure
+
+      - name: Check formatting
+        run: |
+          git ls-files '*.cpp' '*.hpp' | xargs clang-format --dry-run --Werror
+
+  tidy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y \
+            build-essential \
+            cmake \
+            clang \
+            clang-tidy
+
+      - name: Configure
+        run: cmake -S . -B build -G Ninja
+
+      - name: Run clang-tidy
+        run: ./scripts/run_clang_tidy.sh
+
+  sanitizers:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y build-essential cmake clang
+
+      - name: Configure
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Run tests
+        run: cd build && ctest --output-on-failure
