@@ -11,8 +11,10 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 enable_testing()
 
+file(GLOB CORE_SOURCES CONFIGURE_DEPENDS src/*.cpp)
+
 add_library(core
-    src/add.cpp
+    ${CORE_SOURCES}
 )
 
 target_compile_options(core PRIVATE
@@ -37,8 +39,10 @@ FetchContent_Declare(
 
 FetchContent_MakeAvailable(googletest)
 
+file(GLOB TEST_SOURCES CONFIGURE_DEPENDS tests/*.cpp)
+
 add_executable(unit_tests
-    tests/test_add.cpp
+    ${TEST_SOURCES}
 )
 
 target_link_libraries(unit_tests
