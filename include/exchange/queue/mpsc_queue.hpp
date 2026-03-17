@@ -15,6 +15,7 @@ template <typename T> class MpscQueue {
         std::atomic<bool> turn{false};
     };
 
+    // NOLINTNEXTLINE(modernize-avoid-c-arrays)
     std::unique_ptr<Slot[]> buffer_;
     std::size_t capacity_mask_;
 
@@ -26,6 +27,7 @@ template <typename T> class MpscQueue {
         if ((capacity == 0) || ((capacity & (capacity - 1)) != 0)) {
             throw std::invalid_argument("Capacity must be a positive number and power of 2");
         }
+        // NOLINTNEXTLINE(modernize-avoid-c-arrays)
         buffer_ = std::make_unique<Slot[]>(capacity);
         capacity_mask_ = capacity - 1;
     }
