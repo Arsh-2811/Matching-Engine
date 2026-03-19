@@ -63,12 +63,28 @@ void GatewayWorker::handle_client_data(int fd) {
         return;
     auto &session = it->second;
 
-    uint8_t temp_buf[4096];
     while (true) {
-        ssize_t bytes_read = recv(fd, temp_buf, sizeof(temp_buf), 0);
+        // 1. Compaction check
+        if (session.available_space() < 4096) {
+            size_t remaining = session.pending_bytes();
+            if (remaining > 0 && session.read_idx > 0) {
+                std::memmove(session.buffer.data(), session.buffer.data() + session.read_idx,
+                             remaining);
+            }
+            session.read_idx = 0;
+            session.write_idx = remaining;
+            if (session.available_space() < 4096)
+                break;
+        }
+
+        ssize_t bytes_read =
+            recv(fd, session.buffer.data() + session.write_idx, session.available_space(), 0);
+
         if (bytes_read < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK)
                 break;
+            close(fd);
+            sessions_.erase(it);
             return;
         } else if (bytes_read == 0) {
             close(fd);
@@ -76,33 +92,33 @@ void GatewayWorker::handle_client_data(int fd) {
             return;
         }
 
-        session.buffer.insert(session.buffer.end(), temp_buf, temp_buf + bytes_read);
-    }
+        session.write_idx += bytes_read;
 
-    size_t offset = 0;
-    while (session.buffer.size() - offset >= sizeof(MsgHeader)) {
-        auto *header = reinterpret_cast<MsgHeader *>(&session.buffer[offset]);
+        // 2. Process all complete messages
+        while (session.pending_bytes() >= sizeof(MsgHeader)) {
+            auto *header = reinterpret_cast<MsgHeader *>(&session.buffer[session.read_idx]);
+            if (session.pending_bytes() < header->msg_size)
+                break;
 
-        if (session.buffer.size() - offset < header->msg_size)
-            break;
-        auto *sbe_order = reinterpret_cast<SbeOrder *>(&session.buffer[offset + sizeof(MsgHeader)]);
+            auto *sbe_order =
+                reinterpret_cast<SbeOrder *>(&session.buffer[session.read_idx + sizeof(MsgHeader)]);
 
-        engine::Order internal_order{.order_id = sbe_order->order_id,
-                                     .price = sbe_order->price,
-                                     .quantity = sbe_order->quantity,
-                                     .side = static_cast<engine::Side>(sbe_order->side),
-                                     .type = static_cast<engine::OrderType>(sbe_order->type),
-                                     .timestamp_ns = sbe_order->timestamp_ns};
+            engine::Order internal_order{.order_id = sbe_order->order_id,
+                                         .price = sbe_order->price,
+                                         .quantity = sbe_order->quantity,
+                                         .side = static_cast<engine::Side>(sbe_order->side),
+                                         .type = static_cast<engine::OrderType>(sbe_order->type),
+                                         .timestamp_ns = sbe_order->timestamp_ns};
 
-        while (!incoming_queue_.push(internal_order)) {
-            NET_CPU_PAUSE();
+            // FIX: SPIN-WAIT instead of returning.
+            // This prevents the EPOLLET lost-wakeup deadlock.
+            while (!incoming_queue_.push(internal_order)) {
+                NET_CPU_PAUSE();
+                // In a production system, you'd check a shutdown flag here
+            }
+
+            session.read_idx += header->msg_size;
         }
-
-        offset += header->msg_size;
-    }
-
-    if (offset > 0) {
-        session.buffer.erase(session.buffer.begin(), session.buffer.begin() + offset);
     }
 }
 

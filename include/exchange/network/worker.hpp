@@ -2,6 +2,7 @@
 
 #include "exchange/engine/types.hpp"
 #include "exchange/queue/mpsc_queue.hpp"
+#include <cstddef>
 #include <cstdint>
 #include <sys/epoll.h>
 #include <unordered_map>
@@ -13,9 +14,15 @@ class GatewayWorker {
   private:
     struct ClientSession {
         int fd;
+        static constexpr size_t BUFFER_SIZE = 8 * 1024 * 1024;
         std::vector<uint8_t> buffer;
+        size_t read_idx{0};
+        size_t write_idx{0};
 
-        explicit ClientSession(int client_fd) : fd(client_fd) { buffer.reserve(4096); }
+        explicit ClientSession(int client_fd) : fd(client_fd) { buffer.resize(BUFFER_SIZE); }
+
+        auto pending_bytes() -> size_t { return write_idx - read_idx; }
+        auto available_space() -> size_t { return BUFFER_SIZE - write_idx; }
     };
 
     int listen_fd_{-1};

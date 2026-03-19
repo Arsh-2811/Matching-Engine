@@ -9,6 +9,7 @@
 #include <pthread.h>
 #include <sched.h>
 #include <thread>
+#include <x86intrin.h>
 
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
@@ -18,6 +19,8 @@
 #else
 #define ENGINE_CPU_PAUSE()
 #endif
+
+inline auto rdtsc() -> uint64_t { return __rdtsc(); }
 
 namespace exchange::engine {
 class MatchingEngine {
@@ -45,18 +48,26 @@ class MatchingEngine {
                 if (current_order.order_id == 0) {
                     break;
                 }
+                // uint64_t start_cycles = rdtsc();
+                struct timespec ts;
+                clock_gettime(CLOCK_REALTIME, &ts);
+                uint64_t now_ns = static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL + ts.tv_nsec;
+
                 order_book_.process_order(current_order);
 
-                auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                               std::chrono::high_resolution_clock::now().time_since_epoch())
-                               .count();
+                // auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                //                std::chrono::high_resolution_clock::now().time_since_epoch())
+                //                .count();
                 if (current_order.timestamp_ns > 0) {
-                    uint64_t lat = now - current_order.timestamp_ns;
-                    total_latency_ns_.fetch_add(lat, std::memory_order_relaxed);
+                    if (now_ns > current_order.timestamp_ns) {
+                        uint64_t lat = now_ns - current_order.timestamp_ns;
 
-                    uint64_t current_max = max_latency_ns_.load(std::memory_order_relaxed);
-                    while (lat > current_max &&
-                           !max_latency_ns_.compare_exchange_weak(current_max, lat)) {
+                        total_latency_ns_.fetch_add(lat, std::memory_order_relaxed);
+
+                        uint64_t current_max = max_latency_ns_.load(std::memory_order_relaxed);
+                        while (lat > current_max &&
+                               !max_latency_ns_.compare_exchange_weak(current_max, lat)) {
+                        }
                     }
                 }
 

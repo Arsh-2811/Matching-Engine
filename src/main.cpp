@@ -1,3 +1,4 @@
+#include "exchange/common/config.hpp"
 #include "exchange/engine/matching_engine.hpp"
 #include "exchange/engine/order_book.hpp"
 #include "exchange/network/gateway.hpp"
@@ -10,40 +11,40 @@
 using namespace exchange;
 
 auto main() -> int {
-    constexpr std::size_t CAPACITY = 2097152;
-    constexpr std::size_t MAX_ORDERS = 1000000;
-    constexpr std::size_t MIN_PRICE = 1;
-    constexpr std::size_t MAX_PRICE = 10000;
-    constexpr std::size_t TICK_SIZE = 1;
-    constexpr std::size_t PORT = 9000;
+    namespace cfg = exchange::config;
 
-    queue::MpscQueue<engine::Order> incoming_queue(CAPACITY);
-    engine::OrderBook book(MAX_ORDERS, MIN_PRICE, MAX_PRICE, TICK_SIZE);
+    queue::MpscQueue<engine::Order> incoming_queue(cfg::engine::QUEUE_CAPACITY);
+    engine::OrderBook book(cfg::engine::MAX_ORDERS, cfg::engine::MIN_PRICE, cfg::engine::MAX_PRICE,
+                           cfg::engine::TICK_SIZE);
     engine::MatchingEngine engine(incoming_queue, book);
 
-    network::Gateway gateway(incoming_queue, PORT, 2);
+    network::Gateway gateway(incoming_queue, cfg::network::PORT, 2);
 
-    engine.start(1);
-    gateway.start({2, 3});
+    engine.start(cfg::engine::ENGINE_CORE_ID);
+    gateway.start({cfg::engine::GATEWAY_CORE_1, cfg::engine::GATEWAY_CORE_2});
 
-    std::cout << "Exchange is LIVE on port " << PORT << "...\n";
+    std::cout << "Exchange is LIVE on port " << cfg::network::PORT << "...\n";
 
     std::thread stats_thread([&engine]() {
         uint64_t last_count = 0;
+        uint64_t last_latency = 0;
+
         while (true) {
             std::this_thread::sleep_for(std::chrono::seconds(1));
-            uint64_t current = engine.get_total_processed();
-            uint64_t total_lat = engine.get_total_latency();
+            uint64_t current_count = engine.get_total_processed();
+            uint64_t current_total_lat = engine.get_total_latency();
             uint64_t max_lat = engine.get_max_latency();
 
-            uint64_t delta = current - last_count;
-            if (delta > 0) {
-                double avg_lat = static_cast<double>(total_lat) / current;
-                std::cout << "Throughput: " << delta << " | Avg Latency: " << avg_lat << " ns"
-                          << " | Max Jitter: " << max_lat << " ns" << std::endl;
+            uint64_t delta_count = current_count - last_count;
+            uint64_t delta_latency = current_total_lat - last_latency;
+
+            if (delta_count > 0) {
+                double avg_lat = static_cast<double>(delta_latency) / delta_count;
+                std::cout << "Throughput: " << delta_count << " | Snap Avg Latency: " << avg_lat
+                          << " ns" << " | Max Jitter: " << max_lat << " ns" << std::endl;
             }
-            // std::cout << "Throughput: " << (current - last_count) << " orders/sec" << std::endl;
-            last_count = current;
+            last_count = current_count;
+            last_latency = current_total_lat;
         }
     });
     stats_thread.detach();

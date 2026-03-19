@@ -1,3 +1,4 @@
+#include "exchange/common/config.hpp"
 #include "exchange/network/protocol.hpp"
 #include <arpa/inet.h>
 #include <chrono>
@@ -12,14 +13,10 @@
 
 using namespace exchange::network;
 using namespace std::chrono;
-
-constexpr int BATCH_SIZE = 64;
-constexpr int PORT = 9000;
-constexpr int DEFAULT_NO_CLINENTS = 4;
-constexpr int ORDERS_PER_CLIENT = 10000000;
+using namespace exchange::config;
 
 constexpr size_t SINGLE_MSG_SIZE = sizeof(MsgHeader) + sizeof(SbeOrder);
-constexpr size_t BATCH_BYTES = SINGLE_MSG_SIZE * BATCH_SIZE;
+constexpr size_t BATCH_BYTES = SINGLE_MSG_SIZE * load_gen::BATCH_SIZE;
 
 void run_client(int client_id, int num_orders, int port) {
     int sock = socket(AF_INET, SOCK_STREAM, 0);
@@ -64,14 +61,15 @@ void run_client(int client_id, int num_orders, int port) {
         std::memcpy(current_ptr + sizeof(header), &order, sizeof(order));
     }
 
-    int num_batches = num_orders / BATCH_SIZE;
+    int num_batches = num_orders / load_gen::BATCH_SIZE;
     for (int i = 0; i < num_batches; ++i) {
         char *batch_ptr = large_buffer.data() + (i * BATCH_BYTES);
 
-        for (int batch = 0; batch < BATCH_SIZE; ++batch) {
-            uint64_t now =
-                duration_cast<nanoseconds>(high_resolution_clock::now().time_since_epoch()).count();
-            std::memcpy(batch_ptr + (batch * SINGLE_MSG_SIZE) + 26, &now, sizeof(uint64_t));
+        uint64_t batch_now =
+            duration_cast<nanoseconds>(high_resolution_clock::now().time_since_epoch()).count();
+
+        for (int batch = 0; batch < load_gen::BATCH_SIZE; ++batch) {
+            std::memcpy(batch_ptr + (batch * SINGLE_MSG_SIZE) + 26, &batch_now, sizeof(uint64_t));
         }
 
         if (send(sock, batch_ptr, BATCH_BYTES, 0) < 0) {
@@ -84,10 +82,10 @@ void run_client(int client_id, int num_orders, int port) {
 }
 
 int main(int argc, char *argv[]) {
-    int num_clients = (argc > 1) ? std::stoi(argv[1]) : DEFAULT_NO_CLINENTS;
-    int orders_per_client = (argc > 2) ? std::stoi(argv[2]) : ORDERS_PER_CLIENT;
+    int num_clients = (argc > 1) ? std::stoi(argv[1]) : load_gen::NUM_CLIENTS;
+    int orders_per_client = (argc > 2) ? std::stoi(argv[2]) : load_gen::ORDERS_PER_CLIENT;
 
-    orders_per_client = (orders_per_client / BATCH_SIZE) * BATCH_SIZE;
+    orders_per_client = (orders_per_client / load_gen::BATCH_SIZE) * load_gen::BATCH_SIZE;
 
     std::cout << "--- LOAD GENERATOR STARTING ---" << std::endl;
     std::cout << "Clients: " << num_clients << " | Orders per client: " << orders_per_client
@@ -97,7 +95,7 @@ int main(int argc, char *argv[]) {
 
     std::vector<std::thread> clients;
     for (int i = 0; i < num_clients; ++i) {
-        clients.emplace_back(run_client, i, orders_per_client, PORT);
+        clients.emplace_back(run_client, i, orders_per_client, network::PORT);
     }
 
     for (auto &thread : clients) {
