@@ -11,11 +11,13 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 enable_testing()
 
-file(GLOB CORE_SOURCES CONFIGURE_DEPENDS src/*.cpp)
-
 add_library(core
-    ${CORE_SOURCES}
+    src/core.cpp
+    src/network/worker.cpp
 )
+
+add_executable(exchange_app src/main.cpp)
+add_executable(load_gen tests/load_generator.cpp)
 
 target_compile_options(core PRIVATE
     -Wall
@@ -24,6 +26,9 @@ target_compile_options(core PRIVATE
 )
 
 target_include_directories(core PUBLIC include)
+
+target_link_libraries(exchange_app core)
+target_link_libraries(load_gen core)
 
 # -------------------------------
 # GoogleTest (download automatically)
@@ -40,6 +45,7 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(googletest)
 
 file(GLOB TEST_SOURCES CONFIGURE_DEPENDS tests/*.cpp)
+list(FILTER TEST_SOURCES EXCLUDE REGEX ".*load_generator.cpp$")
 
 add_executable(unit_tests
     ${TEST_SOURCES}

@@ -4,6 +4,10 @@
 #include "exchange/engine/types.hpp"
 #include "exchange/queue/mpsc_queue.hpp"
 #include <atomic>
+#include <cstdint>
+#include <cstdio>
+#include <pthread.h>
+#include <sched.h>
 #include <thread>
 
 #if defined(__x86_64__) || defined(_M_X64)
@@ -23,7 +27,17 @@ class MatchingEngine {
     std::atomic<bool> is_running_{false};
     std::thread engine_thread_;
 
-    void run() {
+    std::atomic<uint64_t> total_processed_{0};
+
+    std::atomic<uint64_t> total_latency_ns_{0};
+    std::atomic<uint64_t> max_latency_ns_{0};
+
+    void run(int core_id) {
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+        CPU_SET(core_id, &cpuset);
+        pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+
         Order current_order;
         while (is_running_.load(std::memory_order_acquire)) {
             if (incoming_queue_.pop(current_order)) {
@@ -32,6 +46,21 @@ class MatchingEngine {
                     break;
                 }
                 order_book_.process_order(current_order);
+
+                auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                               std::chrono::high_resolution_clock::now().time_since_epoch())
+                               .count();
+                if (current_order.timestamp_ns > 0) {
+                    uint64_t lat = now - current_order.timestamp_ns;
+                    total_latency_ns_.fetch_add(lat, std::memory_order_relaxed);
+
+                    uint64_t current_max = max_latency_ns_.load(std::memory_order_relaxed);
+                    while (lat > current_max &&
+                           !max_latency_ns_.compare_exchange_weak(current_max, lat)) {
+                    }
+                }
+
+                total_processed_.fetch_add(1, std::memory_order_relaxed);
             } else {
                 ENGINE_CPU_PAUSE();
             }
@@ -50,10 +79,10 @@ class MatchingEngine {
 
     ~MatchingEngine() { stop(); }
 
-    void start() {
+    void start(int core_id) {
         if (!is_running_.load(std::memory_order_relaxed)) {
             is_running_.store(true, std::memory_order_release);
-            engine_thread_ = std::thread(&MatchingEngine::run, this);
+            engine_thread_ = std::thread(&MatchingEngine::run, this, core_id);
         }
     }
 
@@ -65,5 +94,10 @@ class MatchingEngine {
             }
         }
     }
+
+    [[nodiscard]] auto get_total_processed() const -> uint64_t { return total_processed_.load(); }
+
+    uint64_t get_total_latency() { return total_latency_ns_.load(); }
+    uint64_t get_max_latency() { return max_latency_ns_.exchange(0); }
 };
 } // namespace exchange::engine

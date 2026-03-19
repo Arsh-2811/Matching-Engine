@@ -15,6 +15,7 @@ struct alignas(HALF_CACHE_LINE_SIZE) Order {
     uint32_t quantity;
     Side side;
     OrderType type;
+    uint64_t timestamp_ns;
 };
 
 struct Trade {

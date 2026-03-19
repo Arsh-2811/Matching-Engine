@@ -30,3 +30,11 @@ cd build
 cmake -DCMAKE_BUILD_TYPE=Release ..
 make -j$(nproc)
 ```
+
+## Running Benchmark Tests
+
+```bash
+./unit_tests --gtest_filter=SystemBenchmark.ThroughputStressTest
+
+./unit_tests --gtest_filter=MpscQueueBenchmark.Throughput
+```

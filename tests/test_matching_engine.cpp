@@ -14,12 +14,17 @@ TEST(MatchingEngineTest, LifeCycleStartAndStop) {
     constexpr std::size_t CAPACITY = 1024;
     constexpr std::size_t SLEEP_DURATION_MS = 10;
 
+    constexpr std::size_t MAX_ORDERS = 1000;
+    constexpr std::size_t MIN_PRICE = 100;
+    constexpr std::size_t MAX_PRICE = 200;
+    constexpr std::size_t TICK_SIZE = 1;
+
     MpscQueue<Order> order_queue(CAPACITY);
-    OrderBook book{1000, 100, 200, 1};
+    OrderBook book{MAX_ORDERS, MIN_PRICE, MAX_PRICE, TICK_SIZE};
 
     MatchingEngine engine(order_queue, book);
 
-    EXPECT_NO_THROW(engine.start());
+    EXPECT_NO_THROW(engine.start(1));
 
     std::this_thread::sleep_for(std::chrono::microseconds(SLEEP_DURATION_MS));
 
@@ -32,8 +37,13 @@ TEST(MatchingEngineTest, ConsumeOrdersFromQueue) {
     constexpr std::size_t QUANTITY = 100;
     constexpr std::size_t SLEEP_DURATION_MS = 50;
 
+    constexpr std::size_t MAX_ORDERS = 1000;
+    constexpr std::size_t MIN_PRICE = 100;
+    constexpr std::size_t MAX_PRICE = 200;
+    constexpr std::size_t TICK_SIZE = 1;
+
     MpscQueue<Order> order_queue(CAPACITY);
-    OrderBook book{1000, 100, 200, 1};
+    OrderBook book{MAX_ORDERS, MIN_PRICE, MAX_PRICE, TICK_SIZE};
 
     Order new_order{.order_id = 1,
                     .price = PRICE,
@@ -44,7 +54,7 @@ TEST(MatchingEngineTest, ConsumeOrdersFromQueue) {
     ASSERT_TRUE(order_queue.push(new_order));
 
     MatchingEngine engine(order_queue, book);
-    EXPECT_NO_THROW(engine.start());
+    EXPECT_NO_THROW(engine.start(1));
 
     std::this_thread::sleep_for(std::chrono::milliseconds(SLEEP_DURATION_MS));
 
