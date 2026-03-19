@@ -1,4 +1,5 @@
 #include "exchange/network/worker.hpp"
+#include "exchange/network/protocol.hpp"
 #include <cstring>
 #include <fcntl.h>
 #include <iostream>
