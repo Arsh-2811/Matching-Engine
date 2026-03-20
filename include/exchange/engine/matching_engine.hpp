@@ -1,15 +1,14 @@
 #pragma once
 
+#include "exchange/common/tsc.hpp"
 #include "exchange/engine/order_book.hpp"
 #include "exchange/engine/types.hpp"
 #include "exchange/queue/mpsc_queue.hpp"
+#include "exchange/queue/spmc_broadcast_queue.hpp"
 #include <atomic>
-#include <cstdint>
-#include <cstdio>
 #include <pthread.h>
 #include <sched.h>
 #include <thread>
-#include <x86intrin.h>
 
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
@@ -20,20 +19,18 @@
 #define ENGINE_CPU_PAUSE()
 #endif
 
-inline auto rdtsc() -> uint64_t { return __rdtsc(); }
-
 namespace exchange::engine {
+
 class MatchingEngine {
   private:
     queue::MpscQueue<Order> &incoming_queue_;
     OrderBook &order_book_;
+    // Optional outbound queue for ORDER_PROCESSED events. nullptr in unit-test
+    // contexts — no events are emitted and all stat tracking is skipped.
+    queue::SpmcBroadcastQueue<OutboundEvent> *outbound_;
+
     std::atomic<bool> is_running_{false};
     std::thread engine_thread_;
-
-    std::atomic<uint64_t> total_processed_{0};
-
-    std::atomic<uint64_t> total_latency_ns_{0};
-    std::atomic<uint64_t> max_latency_ns_{0};
 
     void run(int core_id) {
         cpu_set_t cpuset;
@@ -44,34 +41,25 @@ class MatchingEngine {
         Order current_order;
         while (is_running_.load(std::memory_order_acquire)) {
             if (incoming_queue_.pop(current_order)) {
-                // THE POISON PILL: If we receive ID 0, break the infinite loop!
+                // Poison pill: order_id == 0 signals graceful shutdown.
                 if (current_order.order_id == 0) {
                     break;
                 }
-                // uint64_t start_cycles = rdtsc();
-                struct timespec ts;
-                clock_gettime(CLOCK_REALTIME, &ts);
-                uint64_t now_ns = static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL + ts.tv_nsec;
 
-                order_book_.process_order(current_order);
+                // Capture TSC before processing to measure queue-to-match latency.
+                uint64_t process_tsc = rdtsc();
+                uint32_t matched_qty = order_book_.process_order(current_order);
 
-                // auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                //                std::chrono::high_resolution_clock::now().time_since_epoch())
-                //                .count();
-                if (current_order.timestamp_ns > 0) {
-                    if (now_ns > current_order.timestamp_ns) {
-                        uint64_t lat = now_ns - current_order.timestamp_ns;
-
-                        total_latency_ns_.fetch_add(lat, std::memory_order_relaxed);
-
-                        uint64_t current_max = max_latency_ns_.load(std::memory_order_relaxed);
-                        while (lat > current_max &&
-                               !max_latency_ns_.compare_exchange_weak(current_max, lat)) {
-                        }
-                    }
+                if (outbound_ != nullptr) {
+                    OutboundEvent event;
+                    event.type = OutboundEventType::ORDER_PROCESSED;
+                    event.order_processed.order_id = current_order.order_id;
+                    event.order_processed.entry_tsc = current_order.timestamp_tsc;
+                    event.order_processed.process_tsc = process_tsc;
+                    event.order_processed.matched_qty = matched_qty;
+                    // Drop on full — metrics miss a tick, engine never stalls.
+                    outbound_->push(event);
                 }
-
-                total_processed_.fetch_add(1, std::memory_order_relaxed);
             } else {
                 ENGINE_CPU_PAUSE();
             }
@@ -80,8 +68,9 @@ class MatchingEngine {
     }
 
   public:
-    explicit MatchingEngine(queue::MpscQueue<Order> &queue, OrderBook &book)
-        : incoming_queue_(queue), order_book_(book) {}
+    explicit MatchingEngine(queue::MpscQueue<Order> &queue, OrderBook &book,
+                            queue::SpmcBroadcastQueue<OutboundEvent> *outbound = nullptr)
+        : incoming_queue_(queue), order_book_(book), outbound_(outbound) {}
 
     MatchingEngine(const MatchingEngine &) = delete;
     MatchingEngine &operator=(const MatchingEngine &) = delete;
@@ -105,10 +94,6 @@ class MatchingEngine {
             }
         }
     }
-
-    [[nodiscard]] auto get_total_processed() const -> uint64_t { return total_processed_.load(); }
-
-    uint64_t get_total_latency() { return total_latency_ns_.load(); }
-    uint64_t get_max_latency() { return max_latency_ns_.exchange(0); }
 };
+
 } // namespace exchange::engine

@@ -1,9 +1,12 @@
 #include "exchange/common/config.hpp"
+#include "exchange/common/tsc.hpp"
 #include "exchange/network/protocol.hpp"
 #include <arpa/inet.h>
+#include <atomic>
 #include <chrono>
+#include <csignal>
+#include <cstdio>
 #include <cstring>
-#include <iostream>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
@@ -12,68 +15,141 @@
 #include <vector>
 
 using namespace exchange::network;
-using namespace std::chrono;
 using namespace exchange::config;
 
-constexpr size_t SINGLE_MSG_SIZE = sizeof(MsgHeader) + sizeof(SbeOrder);
-constexpr size_t BATCH_BYTES = SINGLE_MSG_SIZE * load_gen::BATCH_SIZE;
+static std::atomic<bool> keep_running{true};
 
-void run_client(int client_id, int num_orders, int port) {
+static void signal_handler(int /*sig*/) { keep_running.store(false, std::memory_order_relaxed); }
+
+static constexpr std::size_t SINGLE_MSG_SIZE = sizeof(MsgHeader) + sizeof(SbeOrder);
+static constexpr std::size_t BATCH_BYTES = SINGLE_MSG_SIZE * load_gen::BATCH_SIZE;
+static constexpr int CONNECT_MAX_ATTEMPTS = 10;
+static constexpr int CONNECT_RETRY_MS = 200;
+static constexpr uint32_t ORDER_DEFAULT_QTY = 10;
+static constexpr double UNLIMITED_TOKENS_PER_CYCLE = 1.0e18;
+static constexpr double NS_PER_SEC_DOUBLE = 1.0e9;
+static constexpr int TOKEN_BUCKET_BURST_MULTIPLIER = 4;
+
+// Simple token-bucket rate limiter.
+// tokens_per_cycle = target_orders_per_sec / tsc_frequency_hz
+class TokenBucket {
+  public:
+    TokenBucket(uint64_t target_rate_per_sec, double ns_per_cycle)
+        : tokens_(static_cast<double>(load_gen::BATCH_SIZE)),
+          max_tokens_(static_cast<double>(load_gen::BATCH_SIZE * TOKEN_BUCKET_BURST_MULTIPLIER)),
+          last_tsc_(rdtsc()) {
+        // tokens_per_cycle = rate / (1e9 / ns_per_cycle)
+        if (target_rate_per_sec == 0 || ns_per_cycle <= 0.0) {
+            tokens_per_cycle_ = UNLIMITED_TOKENS_PER_CYCLE;
+        } else {
+            double tsc_hz = NS_PER_SEC_DOUBLE / ns_per_cycle;
+            tokens_per_cycle_ = static_cast<double>(target_rate_per_sec) / tsc_hz;
+        }
+    }
+
+    // Returns true and consumes BATCH_SIZE tokens if available, else false.
+    [[nodiscard]] auto try_consume() -> bool {
+        auto now = rdtsc();
+        double elapsed = static_cast<double>(now - last_tsc_);
+        tokens_ = std::min(max_tokens_, tokens_ + elapsed * tokens_per_cycle_);
+        last_tsc_ = now;
+        if (tokens_ >= static_cast<double>(load_gen::BATCH_SIZE)) {
+            tokens_ -= static_cast<double>(load_gen::BATCH_SIZE);
+            return true;
+        }
+        return false;
+    }
+
+  private:
+    double tokens_;
+    double max_tokens_;
+    double tokens_per_cycle_;
+    uint64_t last_tsc_;
+};
+
+static void run_client(int client_id, uint64_t target_rate_per_sec, double ns_per_cycle, int port) {
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0) {
-        perror("Socket creation failed");
+        std::perror("Socket creation failed");
         return;
     }
 
     int opt = 1;
-    if (setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt)) < 0) {
-        perror("setsockopt TCP_NODELAY failed");
-    }
+    setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
 
     sockaddr_in serv_addr{};
     serv_addr.sin_family = AF_INET;
-    serv_addr.sin_port = htons(port);
+    serv_addr.sin_port = htons(static_cast<uint16_t>(port));
     inet_pton(AF_INET, "127.0.0.1", &serv_addr.sin_addr);
 
     int attempts = 0;
-    while (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
-        if (++attempts > 5) {
-            std::cerr << "Client " << client_id << " failed to connect after 5 attempts.\n";
+    while (connect(sock, reinterpret_cast<struct sockaddr *>(&serv_addr), sizeof(serv_addr)) < 0) {
+        if (++attempts > CONNECT_MAX_ATTEMPTS) {
+            std::fprintf(stderr, "Client %d failed to connect after %d attempts.\n", client_id,
+                         CONNECT_MAX_ATTEMPTS);
             close(sock);
             return;
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        std::this_thread::sleep_for(std::chrono::milliseconds(CONNECT_RETRY_MS));
     }
 
-    std::vector<char> large_buffer(num_orders * SINGLE_MSG_SIZE);
+    // Per-client order ID space, wraps within MAX_ORDERS to stay in lookup table range.
+    // With NUM_CLIENTS=4, each client gets 250K IDs.
+    const uint64_t id_range = engine::MAX_ORDERS / load_gen::NUM_CLIENTS;
+    const uint64_t id_base = static_cast<uint64_t>(client_id) * id_range;
+    uint64_t order_counter = 0;
 
-    for (int i = 0; i < num_orders; ++i) {
-        MsgHeader header{static_cast<uint16_t>(SINGLE_MSG_SIZE), MsgType::NEW_ORDER};
-        SbeOrder order{.order_id = static_cast<uint64_t>(client_id * 10000000 + i + 1),
-                       .price = 100,
-                       .quantity = 10,
-                       .side = 0, // BUY
-                       .type = 0, // NEW
-                       .timestamp_ns = 0};
+    // Mid price walks randomly each batch (clamped to [MID_PRICE_MIN, MID_PRICE_MAX]).
+    uint64_t mid_price = load_gen::MID_PRICE_INIT;
 
-        char *current_ptr = large_buffer.data() + (i * SINGLE_MSG_SIZE);
-        std::memcpy(current_ptr, &header, sizeof(header));
-        std::memcpy(current_ptr + sizeof(header), &order, sizeof(order));
-    }
+    TokenBucket bucket(target_rate_per_sec, ns_per_cycle);
 
-    int num_batches = num_orders / load_gen::BATCH_SIZE;
-    for (int i = 0; i < num_batches; ++i) {
-        char *batch_ptr = large_buffer.data() + (i * BATCH_BYTES);
+    // NOLINTNEXTLINE(modernize-avoid-c-arrays)
+    char batch_buf[BATCH_BYTES];
 
-        uint64_t batch_now =
-            duration_cast<nanoseconds>(high_resolution_clock::now().time_since_epoch()).count();
-
-        for (int batch = 0; batch < load_gen::BATCH_SIZE; ++batch) {
-            std::memcpy(batch_ptr + (batch * SINGLE_MSG_SIZE) + 26, &batch_now, sizeof(uint64_t));
+    while (keep_running.load(std::memory_order_relaxed)) {
+        if (!bucket.try_consume()) {
+            CPU_PAUSE();
+            continue;
         }
 
-        if (send(sock, batch_ptr, BATCH_BYTES, 0) < 0) {
-            perror("Send failed");
+        // Walk the mid price by ±1 each batch.
+        // NOLINTNEXTLINE(cert-msc50-cpp,cert-msc30-c)
+        int delta = (std::rand() % 3) - 1;
+        if (delta > 0 && mid_price < load_gen::MID_PRICE_MAX) {
+            ++mid_price;
+        } else if (delta < 0 && mid_price > load_gen::MID_PRICE_MIN) {
+            --mid_price;
+        }
+
+        for (int idx = 0; idx < load_gen::BATCH_SIZE; ++idx) {
+            uint64_t oid = id_base + (order_counter % id_range) + 1;
+            ++order_counter;
+
+            // Alternate aggressive BUY / SELL to generate continuous matching:
+            //   BUY  at mid+offset: crosses any resting SELL at or below mid+offset
+            //   SELL at mid-offset: crosses any resting BUY  at or above mid-offset
+            bool is_buy = (idx % 2 == 0);
+            uint64_t price = is_buy ? mid_price + load_gen::AGGRESSIVE_OFFSET
+                                    : mid_price - load_gen::AGGRESSIVE_OFFSET;
+
+            // Per-order TSC timestamp for accurate wire-to-match latency measurement.
+            uint64_t order_tsc = rdtsc();
+
+            MsgHeader header{static_cast<uint16_t>(SINGLE_MSG_SIZE), MsgType::NEW_ORDER};
+            SbeOrder order{.order_id = oid,
+                           .price = price,
+                           .quantity = ORDER_DEFAULT_QTY,
+                           .side = static_cast<uint8_t>(is_buy ? 0 : 1),
+                           .type = 0, // NEW
+                           .timestamp_tsc = order_tsc};
+
+            char *ptr = batch_buf + static_cast<std::size_t>(idx) * SINGLE_MSG_SIZE;
+            std::memcpy(ptr, &header, sizeof(header));
+            std::memcpy(ptr + sizeof(header), &order, sizeof(order));
+        }
+
+        if (send(sock, batch_buf, BATCH_BYTES, 0) < 0) {
             break;
         }
     }
@@ -81,37 +157,43 @@ void run_client(int client_id, int num_orders, int port) {
     close(sock);
 }
 
-int main(int argc, char *argv[]) {
+auto main(int argc, char *argv[]) -> int {
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+
     int num_clients = (argc > 1) ? std::stoi(argv[1]) : load_gen::NUM_CLIENTS;
-    int orders_per_client = (argc > 2) ? std::stoi(argv[2]) : load_gen::ORDERS_PER_CLIENT;
+    // Rate limit in orders/sec per client. 0 = unlimited.
+    uint64_t rate_per_client =
+        (argc > 2) ? static_cast<uint64_t>(std::stoll(argv[2])) : load_gen::DEFAULT_RATE_LIMIT;
 
-    orders_per_client = (orders_per_client / load_gen::BATCH_SIZE) * load_gen::BATCH_SIZE;
+    std::printf("--- LOAD GENERATOR STARTING ---\n");
+    std::printf("Clients: %d | Rate per client: %s orders/s\n", num_clients,
+                rate_per_client == 0 ? "unlimited" : std::to_string(rate_per_client).c_str());
 
-    std::cout << "--- LOAD GENERATOR STARTING ---" << std::endl;
-    std::cout << "Clients: " << num_clients << " | Orders per client: " << orders_per_client
-              << std::endl;
+    // Calibrate TSC once — shared across all client threads.
+    double ns_per_cycle =
+        exchange::common::calibrate_tsc_ns_per_cycle(exchange::config::engine::TSC_CALIBRATION_MS);
+    std::printf("TSC calibration: %.4f ns/cycle\n", ns_per_cycle);
 
-    auto start_time = high_resolution_clock::now();
+    auto start_time = std::chrono::high_resolution_clock::now();
 
     std::vector<std::thread> clients;
+    clients.reserve(static_cast<std::size_t>(num_clients));
     for (int i = 0; i < num_clients; ++i) {
-        clients.emplace_back(run_client, i, orders_per_client, network::PORT);
+        clients.emplace_back(run_client, i, rate_per_client, ns_per_cycle, network::PORT);
     }
 
-    for (auto &thread : clients) {
-        if (thread.joinable()) {
-            thread.join();
+    for (auto &client_thread : clients) {
+        if (client_thread.joinable()) {
+            client_thread.join();
         }
     }
 
-    auto end_time = high_resolution_clock::now();
-    duration<double> diff = end_time - start_time;
+    auto end_time = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> diff = end_time - start_time;
 
-    std::cout << "--- LOAD GENERATOR FINISHED ---" << std::endl;
-    std::cout << "Total Orders: " << (num_clients * orders_per_client) << std::endl;
-    std::cout << "Total Time:   " << diff.count() << " seconds" << std::endl;
-    std::cout << "Throughput:   " << (num_clients * orders_per_client) / diff.count()
-              << " orders/sec" << std::endl;
+    std::printf("--- LOAD GENERATOR STOPPED ---\n");
+    std::printf("Total Time: %.3f seconds\n", diff.count());
 
     return 0;
 }

@@ -108,7 +108,7 @@ void GatewayWorker::handle_client_data(int fd) {
                                          .quantity = sbe_order->quantity,
                                          .side = static_cast<engine::Side>(sbe_order->side),
                                          .type = static_cast<engine::OrderType>(sbe_order->type),
-                                         .timestamp_ns = sbe_order->timestamp_ns};
+                                         .timestamp_tsc = sbe_order->timestamp_tsc};
 
             // FIX: SPIN-WAIT instead of returning.
             // This prevents the EPOLLET lost-wakeup deadlock.

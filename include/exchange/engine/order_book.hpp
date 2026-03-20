@@ -25,7 +25,9 @@ class OrderBook {
     uint64_t highest_bid_;
     uint64_t lowest_ask_;
 
-    void match_buy(Order &taker) {
+    // Returns the total quantity matched during this fill sweep.
+    auto match_buy(Order &taker) -> uint32_t {
+        uint32_t total_matched = 0;
         for (uint64_t price = lowest_ask_; price <= taker.price; price += tick_size_) {
             PriceLevel *level = asks_.get_level(price);
             if (level == nullptr || level->head == nullptr) {
@@ -39,7 +41,7 @@ class OrderBook {
             while (maker != nullptr && taker.quantity > 0) {
                 uint32_t trade_qty = std::min(taker.quantity, maker->quantity);
 
-                // TODO : Push this trade to an outbound queue
+                total_matched += trade_qty;
                 taker.quantity -= trade_qty;
                 maker->quantity -= trade_qty;
                 level->total_quantity -= trade_qty;
@@ -66,9 +68,12 @@ class OrderBook {
                 break;
             }
         }
+        return total_matched;
     }
 
-    void match_sell(Order &taker) {
+    // Returns the total quantity matched during this fill sweep.
+    auto match_sell(Order &taker) -> uint32_t {
+        uint32_t total_matched = 0;
         for (uint64_t price = highest_bid_; price >= taker.price; price -= tick_size_) {
             PriceLevel *level = bids_.get_level(price);
             if (level == nullptr || level->head == nullptr) {
@@ -84,6 +89,7 @@ class OrderBook {
             while (maker != nullptr && taker.quantity > 0) {
                 uint32_t trade_qty = std::min(taker.quantity, maker->quantity);
 
+                total_matched += trade_qty;
                 taker.quantity -= trade_qty;
                 maker->quantity -= trade_qty;
                 level->total_quantity -= trade_qty;
@@ -110,22 +116,25 @@ class OrderBook {
                 break;
             }
         }
+        return total_matched;
     }
 
-    void on_new_order(Order &order) {
+    // Returns total matched quantity (0 for a fully resting order).
+    auto on_new_order(Order &order) -> uint32_t {
+        uint32_t matched = 0;
         if (order.side == Side::BUY) {
-            match_buy(order);
+            matched = match_buy(order);
         } else {
-            match_sell(order);
+            matched = match_sell(order);
         }
 
         if (order.quantity == 0) {
-            return;
+            return matched;
         }
 
         OrderNode *node = node_pool_.allocate();
         if (node == nullptr) {
-            return; // In a real system, we would trigger a critical hault here
+            return matched; // In a real system, we would trigger a critical halt here
         }
         node->order_id = order.order_id;
         node->price = order.price;
@@ -150,11 +159,11 @@ class OrderBook {
 
         if (level == nullptr) {
             node_pool_.deallocate(node);
-            return;
+            return matched;
         }
 
-        // level->append_order(node);
         order_lookup_.add_order(order.order_id, node);
+        return matched;
     }
 
     void on_cancel_order(const Order &order) {
@@ -182,20 +191,20 @@ class OrderBook {
     OrderBook(const OrderBook &) = delete;
     OrderBook &operator=(const OrderBook &) = delete;
 
-    void process_order(const Order &incoming_order) {
+    // Returns total quantity matched for this order (0 for fully resting orders).
+    auto process_order(const Order &incoming_order) -> uint32_t {
         Order order = incoming_order;
         switch (order.type) {
         case OrderType::NEW:
-            on_new_order(order);
-            break;
+            return on_new_order(order);
         case OrderType::CANCEL:
             on_cancel_order(order);
-            break;
+            return 0;
         case OrderType::MODIFY:
             on_cancel_order(order);
-            on_new_order(order);
-            break;
+            return on_new_order(order);
         }
+        return 0;
     }
 
     // Public getters for testing and asserting state
