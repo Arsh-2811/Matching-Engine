@@ -217,17 +217,20 @@ def main():
     print(f"{'='*90}")
     print(
         f"  {'Label':<22} {'MeanTput':>10} {'P50Tput':>10} "
-        f"{'MeanAvgLat':>12} {'P99AvgLat':>12} {'P99MaxLat':>12}"
+        f"{'MeanAvgLat':>12} {'MeanP99Lat':>12} {'P99ofP99Lat':>13}"
     )
-    print(f"  {'-'*22} {'-'*10} {'-'*10} {'-'*12} {'-'*12} {'-'*12}")
+    print(f"  {'-'*22} {'-'*10} {'-'*10} {'-'*12} {'-'*12} {'-'*13}")
     for label, row in summary_rows:
+        # mean_p99_latency_ns is new; fall back to p99_avg_latency_ns for old CSVs.
+        mean_p99 = float(row.get('mean_p99_latency_ns', row.get('p99_avg_latency_ns', 0)))
+        p99_of_p99 = float(row.get('p99_p99_latency_ns', row.get('p99_max_latency_ns', 0)))
         print(
             f"  {label:<22} "
             f"{float(row.get('mean_throughput', 0))/1e6:>9.2f}M "
             f"{float(row.get('p50_throughput',  0))/1e6:>9.2f}M "
             f"{float(row.get('mean_avg_latency_ns', 0))/1e6:>11.2f}ms "
-            f"{float(row.get('p99_avg_latency_ns',  0))/1e6:>11.2f}ms "
-            f"{float(row.get('p99_max_latency_ns',  0))/1e6:>11.2f}ms"
+            f"{mean_p99/1e6:>11.2f}ms "
+            f"{p99_of_p99/1e6:>12.2f}ms"
         )
 
     print(f"\n  Master per-second CSV : {master_ps}")

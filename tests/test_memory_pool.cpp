@@ -24,13 +24,13 @@ TEST(MemoryPoolTest, AllocateDecreasesAvailability) {
 TEST(MemoryPoolTest, DeallocateRecyclesMemoryAndRequiresReset) {
     constexpr std::size_t CAPACITY = 5;
     constexpr uint64_t TEST_ORDER_ID = 999;
-    constexpr uint64_t TEST_PRICE = 10050;
+    constexpr uint32_t TEST_QUANTITY = 42;
 
     MemoryPool<OrderNode> pool(CAPACITY);
 
     OrderNode *order1 = pool.allocate();
     order1->order_id = TEST_ORDER_ID;
-    order1->price = TEST_PRICE;
+    order1->quantity = TEST_QUANTITY;
 
     pool.deallocate(order1);
     EXPECT_EQ(pool.available(), 5);
@@ -38,10 +38,13 @@ TEST(MemoryPoolTest, DeallocateRecyclesMemoryAndRequiresReset) {
     OrderNode *order2 = pool.allocate();
     EXPECT_EQ(order1, order2);
 
-    EXPECT_EQ(order2->order_id, 999);
+    // State must be preserved until reset() is explicitly called.
+    EXPECT_EQ(order2->order_id, TEST_ORDER_ID);
+    EXPECT_EQ(order2->quantity, TEST_QUANTITY);
 
     order2->reset();
     EXPECT_EQ(order2->order_id, 0);
+    EXPECT_EQ(order2->quantity, 0);
 }
 
 TEST(MemoryPoolTest, ExhaustionReturnsNullptr) {
@@ -66,4 +69,23 @@ TEST(MemoryPoolTest, ContiguousMemoryProof) {
     auto ptr2_address = reinterpret_cast<std::uintptr_t>(order2);
 
     EXPECT_EQ(ptr2_address - ptr1_address, sizeof(OrderNode));
+}
+
+TEST(MemoryPoolTest, GetByIndexRoundTrips) {
+    MemoryPool<OrderNode> pool(4);
+
+    OrderNode *node0 = pool.allocate();
+    OrderNode *node1 = pool.allocate();
+
+    uint32_t idx0 = pool.index_of(node0);
+    uint32_t idx1 = pool.index_of(node1);
+
+    EXPECT_NE(idx0, idx1);
+    EXPECT_EQ(&pool.get(idx0), node0);
+    EXPECT_EQ(&pool.get(idx1), node1);
+}
+
+TEST(MemoryPoolTest, NodeSizeIs32Bytes) {
+    // Verifies the uint32_t-index layout achieves the expected cache density.
+    EXPECT_EQ(sizeof(OrderNode), 32U);
 }

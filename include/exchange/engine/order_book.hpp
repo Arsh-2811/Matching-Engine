@@ -25,36 +25,85 @@ class OrderBook {
     uint64_t highest_bid_;
     uint64_t lowest_ask_;
 
+    // Link node at the tail of level's list. node must already be allocated
+    // from node_pool_ and have order_id / quantity / side populated.
+    void append_to_level(PriceLevel *level, OrderNode *node) {
+        uint32_t node_idx = node_pool_.index_of(node);
+        node->price_level = level;
+        node->next_idx = OrderNode::NULL_IDX;
+        node->prev_idx = level->tail_idx;
+
+        if (level->tail_idx != OrderNode::NULL_IDX) {
+            node_pool_.get(level->tail_idx).next_idx = node_idx;
+        } else {
+            level->head_idx = node_idx; // list was empty
+        }
+
+        level->tail_idx = node_idx;
+        level->total_quantity += node->quantity;
+    }
+
+    // Unlink node from level's list without touching total_quantity.
+    // Caller is responsible for adjusting total_quantity if needed.
+    void unlink_from_level(PriceLevel *level, OrderNode *node) {
+        if (node->prev_idx != OrderNode::NULL_IDX) {
+            node_pool_.get(node->prev_idx).next_idx = node->next_idx;
+        } else {
+            level->head_idx = node->next_idx; // node was head
+        }
+
+        if (node->next_idx != OrderNode::NULL_IDX) {
+            node_pool_.get(node->next_idx).prev_idx = node->prev_idx;
+        } else {
+            level->tail_idx = node->prev_idx; // node was tail
+        }
+
+        node->prev_idx = OrderNode::NULL_IDX;
+        node->next_idx = OrderNode::NULL_IDX;
+        node->price_level = nullptr;
+    }
+
     // Returns the total quantity matched during this fill sweep.
     auto match_buy(Order &taker) -> uint32_t {
         uint32_t total_matched = 0;
         for (uint64_t price = lowest_ask_; price <= taker.price; price += tick_size_) {
             PriceLevel *level = asks_.get_level(price);
-            if (level == nullptr || level->head == nullptr) {
+            if (level == nullptr || level->head_idx == OrderNode::NULL_IDX) {
                 if (price == lowest_ask_) {
                     lowest_ask_ = price + tick_size_;
                 }
                 continue;
             }
-            OrderNode *maker = level->head;
 
-            while (maker != nullptr && taker.quantity > 0) {
-                uint32_t trade_qty = std::min(taker.quantity, maker->quantity);
+            uint32_t maker_idx = level->head_idx;
+            while (maker_idx != OrderNode::NULL_IDX && taker.quantity > 0) {
+                OrderNode &maker = node_pool_.get(maker_idx);
+                // Prefetch the next node into L1 while we compute trade_qty for
+                // the current node. Hides the cache-miss latency on deep books.
+                if (maker.next_idx != OrderNode::NULL_IDX) {
+                    __builtin_prefetch(&node_pool_.get(maker.next_idx), 0, 3);
+                }
+                uint32_t trade_qty = std::min(taker.quantity, maker.quantity);
 
                 total_matched += trade_qty;
                 taker.quantity -= trade_qty;
-                maker->quantity -= trade_qty;
+                maker.quantity -= trade_qty;
                 level->total_quantity -= trade_qty;
 
-                if (maker->quantity == 0) {
-                    OrderNode *next_maker = maker->next;
-
-                    level->remove_order(maker);
-                    order_lookup_.remove_order(maker->order_id);
-                    maker->reset();
-                    node_pool_.deallocate(maker);
-
-                    maker = next_maker;
+                if (maker.quantity == 0) {
+                    uint32_t next_idx = maker.next_idx;
+                    // Matching always consumes from the head — fast-path unlink.
+                    level->head_idx = next_idx;
+                    if (next_idx != OrderNode::NULL_IDX) {
+                        node_pool_.get(next_idx).prev_idx = OrderNode::NULL_IDX;
+                    } else {
+                        level->tail_idx = OrderNode::NULL_IDX;
+                    }
+                    maker.price_level = nullptr;
+                    order_lookup_.remove_order(maker.order_id);
+                    maker.reset();
+                    node_pool_.deallocate(&maker);
+                    maker_idx = next_idx;
                 } else {
                     break;
                 }
@@ -76,7 +125,7 @@ class OrderBook {
         uint32_t total_matched = 0;
         for (uint64_t price = highest_bid_; price >= taker.price; price -= tick_size_) {
             PriceLevel *level = bids_.get_level(price);
-            if (level == nullptr || level->head == nullptr) {
+            if (level == nullptr || level->head_idx == OrderNode::NULL_IDX) {
                 if (price == highest_bid_) {
                     highest_bid_ = (price > tick_size_) ? price - tick_size_ : min_price_;
                 }
@@ -85,24 +134,36 @@ class OrderBook {
                 }
                 continue;
             }
-            OrderNode *maker = level->head;
-            while (maker != nullptr && taker.quantity > 0) {
-                uint32_t trade_qty = std::min(taker.quantity, maker->quantity);
+
+            uint32_t maker_idx = level->head_idx;
+            while (maker_idx != OrderNode::NULL_IDX && taker.quantity > 0) {
+                OrderNode &maker = node_pool_.get(maker_idx);
+                // Prefetch the next node into L1 while we compute trade_qty for
+                // the current node. Hides the cache-miss latency on deep books.
+                if (maker.next_idx != OrderNode::NULL_IDX) {
+                    __builtin_prefetch(&node_pool_.get(maker.next_idx), 0, 3);
+                }
+                uint32_t trade_qty = std::min(taker.quantity, maker.quantity);
 
                 total_matched += trade_qty;
                 taker.quantity -= trade_qty;
-                maker->quantity -= trade_qty;
+                maker.quantity -= trade_qty;
                 level->total_quantity -= trade_qty;
 
-                if (maker->quantity == 0) {
-                    OrderNode *next_maker = maker->next;
-
-                    level->remove_order(maker);
-                    order_lookup_.remove_order(maker->order_id);
-                    maker->reset();
-                    node_pool_.deallocate(maker);
-
-                    maker = next_maker;
+                if (maker.quantity == 0) {
+                    uint32_t next_idx = maker.next_idx;
+                    // Matching always consumes from the head — fast-path unlink.
+                    level->head_idx = next_idx;
+                    if (next_idx != OrderNode::NULL_IDX) {
+                        node_pool_.get(next_idx).prev_idx = OrderNode::NULL_IDX;
+                    } else {
+                        level->tail_idx = OrderNode::NULL_IDX;
+                    }
+                    maker.price_level = nullptr;
+                    order_lookup_.remove_order(maker.order_id);
+                    maker.reset();
+                    node_pool_.deallocate(&maker);
+                    maker_idx = next_idx;
                 } else {
                     break;
                 }
@@ -137,7 +198,6 @@ class OrderBook {
             return matched; // In a real system, we would trigger a critical halt here
         }
         node->order_id = order.order_id;
-        node->price = order.price;
         node->quantity = order.quantity;
         node->side = order.side;
 
@@ -145,14 +205,13 @@ class OrderBook {
         if (order.side == Side::BUY) {
             level = bids_.get_level(order.price);
             if (level != nullptr) {
-                level->append_order(node);
+                append_to_level(level, node);
                 highest_bid_ = std::max(highest_bid_, order.price);
             }
-
         } else {
             level = asks_.get_level(order.price);
             if (level != nullptr) {
-                level->append_order(node);
+                append_to_level(level, node);
                 lowest_ask_ = std::min(lowest_ask_, order.price);
             }
         }
@@ -174,7 +233,8 @@ class OrderBook {
 
         PriceLevel *level = node->price_level;
         if (level != nullptr) {
-            level->remove_order(node);
+            level->total_quantity -= node->quantity;
+            unlink_from_level(level, node);
         }
 
         order_lookup_.remove_order(order.order_id);
@@ -212,6 +272,15 @@ class OrderBook {
     [[nodiscard]] auto get_asks() -> PriceLevelIndex & { return asks_; }
     [[nodiscard]] auto get_available_capacity() const -> std::size_t {
         return node_pool_.available();
+    }
+
+    // Returns a pointer to the head OrderNode for a given PriceLevel, or
+    // nullptr if the level is empty. Used in tests and for book inspection.
+    [[nodiscard]] auto get_head_node(const PriceLevel *level) const -> const OrderNode * {
+        if (level == nullptr || level->head_idx == OrderNode::NULL_IDX) {
+            return nullptr;
+        }
+        return &node_pool_.get(level->head_idx);
     }
 };
 } // namespace exchange::engine

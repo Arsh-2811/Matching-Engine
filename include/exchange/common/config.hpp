@@ -28,7 +28,7 @@ constexpr uint64_t TSC_CALIBRATION_MS = 50; // Duration for TSC frequency calibr
 namespace load_gen {
 constexpr int NUM_CLIENTS = 4;
 constexpr int ORDERS_PER_CLIENT = 10000000;
-constexpr int BATCH_SIZE = 64;
+constexpr int BATCH_SIZE = 32;
 
 // Mid-price parameters for continuous matching load
 constexpr uint64_t MID_PRICE_INIT = 1000; // Starting mid price

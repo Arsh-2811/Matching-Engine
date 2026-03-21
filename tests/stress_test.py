@@ -72,6 +72,9 @@ def parse_config(path: Path) -> dict:
 METRICS_RE = re.compile(
     r"Throughput:\s+([\d.]+)\s+orders/s"
     r".*?Avg Latency:\s+([\d.]+)\s+ns"
+    r".*?P50 Latency:\s+([\d.]+)\s+ns"
+    r".*?P99 Latency:\s+([\d.]+)\s+ns"
+    r".*?P99\.9 Latency:\s+([\d.]+)\s+ns"
     r".*?Max Latency:\s+([\d.]+)\s+ns"
     r".*?Fill Rate:\s+([\d.]+)%"
     r".*?Volume:\s+([\d]+)"
@@ -85,9 +88,12 @@ def parse_metrics_line(line: str):
     return {
         "throughput_orders_per_s": float(m.group(1)),
         "avg_latency_ns":          float(m.group(2)),
-        "max_latency_ns":          float(m.group(3)),
-        "fill_rate_pct":           float(m.group(4)),
-        "volume":                  int(m.group(5)),
+        "p50_latency_ns":          float(m.group(3)),
+        "p99_latency_ns":          float(m.group(4)),
+        "p999_latency_ns":         float(m.group(5)),
+        "max_latency_ns":          float(m.group(6)),
+        "fill_rate_pct":           float(m.group(7)),
+        "volume":                  int(m.group(8)),
     }
 
 # ---------------------------------------------------------------------------
@@ -206,8 +212,8 @@ def run_stress_test(duration: int, num_clients: int, rate: int,
     deadline_run = time.monotonic() + duration
 
     print(f"[run] Collecting for {duration}s  (Ctrl+C to abort early)\n")
-    print(f"  {'Sec':>4}  {'Throughput':>12}  {'AvgLat':>12}  {'MaxLat':>12}  {'Fill%':>6}")
-    print(f"  {'-'*4}  {'-'*12}  {'-'*12}  {'-'*12}  {'-'*6}")
+    print(f"  {'Sec':>4}  {'Throughput':>12}  {'AvgLat':>10}  {'P50Lat':>10}  {'P99Lat':>10}  {'Fill%':>6}")
+    print(f"  {'-'*4}  {'-'*12}  {'-'*10}  {'-'*10}  {'-'*10}  {'-'*6}")
 
     try:
         while time.monotonic() < deadline_run:
@@ -226,8 +232,9 @@ def run_stress_test(duration: int, num_clients: int, rate: int,
                 print(
                     f"  {second:>4}  "
                     f"{row['throughput_orders_per_s']/1e6:>10.2f}M/s  "
-                    f"{row['avg_latency_ns']/1e6:>10.2f} ms  "
-                    f"{row['max_latency_ns']/1e6:>10.2f} ms  "
+                    f"{row['avg_latency_ns']/1e6:>8.2f} ms  "
+                    f"{row['p50_latency_ns']/1e6:>8.2f} ms  "
+                    f"{row['p99_latency_ns']/1e6:>8.2f} ms  "
                     f"{row['fill_rate_pct']:>5.1f}%"
                 )
     except KeyboardInterrupt:
@@ -268,31 +275,41 @@ def run_stress_test(duration: int, num_clients: int, rate: int,
         return run_dir
 
     # ---------- compute summary ----------
-    tputs    = [r["throughput_orders_per_s"] for r in per_second_rows]
-    avg_lats = [r["avg_latency_ns"]          for r in per_second_rows]
-    max_lats = [r["max_latency_ns"]          for r in per_second_rows]
+    tputs     = [r["throughput_orders_per_s"] for r in per_second_rows]
+    avg_lats  = [r["avg_latency_ns"]          for r in per_second_rows]
+    p50_lats  = [r["p50_latency_ns"]          for r in per_second_rows]
+    p99_lats  = [r["p99_latency_ns"]          for r in per_second_rows]
+    p999_lats = [r["p999_latency_ns"]         for r in per_second_rows]
+    max_lats  = [r["max_latency_ns"]          for r in per_second_rows]
 
     summary = {
-        "seconds_collected":     len(per_second_rows),
-        "total_orders":          sum(int(r["throughput_orders_per_s"]) for r in per_second_rows),
+        "seconds_collected":      len(per_second_rows),
+        "total_orders":           sum(int(r["throughput_orders_per_s"]) for r in per_second_rows),
         # Throughput
-        "mean_throughput":       statistics.mean(tputs),
-        "p50_throughput":        percentile(tputs, 50),
-        "p95_throughput":        percentile(tputs, 95),
-        "p99_throughput":        percentile(tputs, 99),
-        "min_throughput":        min(tputs),
-        "max_throughput":        max(tputs),
-        "stdev_throughput":      statistics.stdev(tputs) if len(tputs) > 1 else 0,
-        # Average latency
-        "mean_avg_latency_ns":   statistics.mean(avg_lats),
-        "p50_avg_latency_ns":    percentile(avg_lats, 50),
-        "p95_avg_latency_ns":    percentile(avg_lats, 95),
-        "p99_avg_latency_ns":    percentile(avg_lats, 99),
-        "min_avg_latency_ns":    min(avg_lats),
-        "max_avg_latency_ns":    max(avg_lats),
-        # Peak latency
-        "mean_max_latency_ns":   statistics.mean(max_lats),
-        "p99_max_latency_ns":    percentile(max_lats, 99),
+        "mean_throughput":        statistics.mean(tputs),
+        "p50_throughput":         percentile(tputs, 50),
+        "p95_throughput":         percentile(tputs, 95),
+        "p99_throughput":         percentile(tputs, 99),
+        "min_throughput":         min(tputs),
+        "max_throughput":         max(tputs),
+        "stdev_throughput":       statistics.stdev(tputs) if len(tputs) > 1 else 0,
+        # Average latency (mean across the per-second avg values)
+        "mean_avg_latency_ns":    statistics.mean(avg_lats),
+        "p50_avg_latency_ns":     percentile(avg_lats, 50),
+        "p95_avg_latency_ns":     percentile(avg_lats, 95),
+        "p99_avg_latency_ns":     percentile(avg_lats, 99),
+        "min_avg_latency_ns":     min(avg_lats),
+        "max_avg_latency_ns":     max(avg_lats),
+        # Histogram-derived latency percentiles (aggregated across seconds)
+        "mean_p50_latency_ns":    statistics.mean(p50_lats),
+        "p99_p50_latency_ns":     percentile(p50_lats, 99),
+        "mean_p99_latency_ns":    statistics.mean(p99_lats),
+        "p99_p99_latency_ns":     percentile(p99_lats, 99),
+        "mean_p999_latency_ns":   statistics.mean(p999_lats),
+        "p99_p999_latency_ns":    percentile(p999_lats, 99),
+        # Worst-case latency (max per second, includes OS scheduling spikes)
+        "mean_max_latency_ns":    statistics.mean(max_lats),
+        "p99_max_latency_ns":     percentile(max_lats, 99),
     }
 
     # Common metadata columns prefixed so they sort together in Excel
@@ -309,6 +326,7 @@ def run_stress_test(duration: int, num_clients: int, rate: int,
     ps_fields = (
         list(run_meta.keys()) + list(cfg_meta.keys()) +
         ["second", "throughput_orders_per_s", "avg_latency_ns",
+         "p50_latency_ns", "p99_latency_ns", "p999_latency_ns",
          "max_latency_ns", "fill_rate_pct", "volume"]
     )
     with open(per_second_csv, "w", newline="") as f:
@@ -338,12 +356,15 @@ def run_stress_test(duration: int, num_clients: int, rate: int,
     print(f"\n{'='*60}")
     print(f" STRESS TEST COMPLETE — {len(per_second_rows)} seconds collected")
     print(f"{'='*60}")
-    print(f"  Mean throughput : {summary['mean_throughput']/1e6:>8.2f} M orders/s")
-    print(f"  P50  throughput : {summary['p50_throughput']/1e6:>8.2f} M orders/s")
-    print(f"  P95  throughput : {summary['p95_throughput']/1e6:>8.2f} M orders/s")
-    print(f"  Max  throughput : {summary['max_throughput']/1e6:>8.2f} M orders/s")
-    print(f"  Mean avg latency: {summary['mean_avg_latency_ns']/1e6:>8.2f} ms")
-    print(f"  P99  avg latency: {summary['p99_avg_latency_ns']/1e6:>8.2f} ms")
+    print(f"  Mean throughput  : {summary['mean_throughput']/1e6:>8.2f} M orders/s")
+    print(f"  P50  throughput  : {summary['p50_throughput']/1e6:>8.2f} M orders/s")
+    print(f"  P95  throughput  : {summary['p95_throughput']/1e6:>8.2f} M orders/s")
+    print(f"  Max  throughput  : {summary['max_throughput']/1e6:>8.2f} M orders/s")
+    print(f"  Mean avg latency : {summary['mean_avg_latency_ns']/1e6:>8.2f} ms")
+    print(f"  Mean P50 latency : {summary['mean_p50_latency_ns']/1e6:>8.2f} ms")
+    print(f"  Mean P99 latency : {summary['mean_p99_latency_ns']/1e6:>8.2f} ms")
+    print(f"  P99  P99 latency : {summary['p99_p99_latency_ns']/1e6:>8.2f} ms")
+    print(f"  Mean P99.9 lat   : {summary['mean_p999_latency_ns']/1e6:>8.2f} ms")
     print(f"\n  per_second.csv  → {per_second_csv}")
     print(f"  summary.csv     → {summary_csv}")
     print(f"  all_runs_summary→ {global_csv}")

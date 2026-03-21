@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <stdexcept>
 #include <vector>
 
@@ -45,5 +46,14 @@ template <typename T> class MemoryPool {
     }
 
     [[nodiscard]] auto available() const -> std::size_t { return free_list_.size(); }
+
+    // Direct index-based access into the contiguous slab.
+    [[nodiscard]] auto get(uint32_t idx) -> T & { return buffer_[idx]; }
+    [[nodiscard]] auto get(uint32_t idx) const -> const T & { return buffer_[idx]; }
+
+    // Convert a slab pointer back to its uint32_t index (ptr must belong to this pool).
+    [[nodiscard]] auto index_of(const T *ptr) const -> uint32_t {
+        return static_cast<uint32_t>(ptr - buffer_.data());
+    }
 };
 } // namespace exchange::engine
