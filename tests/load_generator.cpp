@@ -67,7 +67,35 @@ class TokenBucket {
     uint64_t last_tsc_;
 };
 
+namespace {
+// Xorshift64 — lock-free per-thread RNG to avoid std::rand() global lock contention.
+constexpr uint64_t RNG_FALLBACK_SEED = 0xdeadbeefcafe1234ULL;
+constexpr uint64_t RNG_THREAD_ID_SHIFT = 32;
+constexpr int XS_SHIFT_A = 13;
+constexpr int XS_SHIFT_B = 7;
+constexpr int XS_SHIFT_C = 17;
+
+thread_local uint64_t tl_rng_state = 0;
+
+void tl_rng_seed() {
+    tl_rng_state =
+        rdtsc() ^ (static_cast<uint64_t>(std::hash<std::thread::id>{}(std::this_thread::get_id()))
+                   << RNG_THREAD_ID_SHIFT);
+    if (tl_rng_state == 0) {
+        tl_rng_state = RNG_FALLBACK_SEED;
+    }
+}
+
+auto tl_rand() -> uint64_t {
+    tl_rng_state ^= tl_rng_state << XS_SHIFT_A;
+    tl_rng_state ^= tl_rng_state >> XS_SHIFT_B;
+    tl_rng_state ^= tl_rng_state << XS_SHIFT_C;
+    return tl_rng_state;
+}
+} // namespace
+
 static void run_client(int client_id, uint64_t target_rate_per_sec, double ns_per_cycle, int port) {
+    tl_rng_seed();
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0) {
         std::perror("Socket creation failed");
@@ -114,8 +142,7 @@ static void run_client(int client_id, uint64_t target_rate_per_sec, double ns_pe
         }
 
         // Walk the mid price by ±1 each batch.
-        // NOLINTNEXTLINE(cert-msc50-cpp,cert-msc30-c)
-        int delta = (std::rand() % 3) - 1;
+        int delta = static_cast<int>(tl_rand() % 3) - 1;
         if (delta > 0 && mid_price < load_gen::MID_PRICE_MAX) {
             ++mid_price;
         } else if (delta < 0 && mid_price > load_gen::MID_PRICE_MIN) {

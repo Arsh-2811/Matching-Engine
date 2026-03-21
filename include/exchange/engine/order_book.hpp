@@ -183,10 +183,44 @@ class OrderBook {
     // Returns total matched quantity (0 for a fully resting order).
     auto on_new_order(Order &order) -> uint32_t {
         uint32_t matched = 0;
+
+        // FOK: check available liquidity BEFORE touching the book.
+        if (order.type == OrderType::FOK) {
+            uint32_t avail = 0;
+            if (order.side == Side::BUY) {
+                for (uint64_t p = lowest_ask_; p <= order.price && avail < order.quantity;
+                     p += tick_size_) {
+                    PriceLevel *lvl = asks_.get_level(p);
+                    if (lvl != nullptr) {
+                        avail += lvl->total_quantity;
+                    }
+                }
+            } else {
+                for (uint64_t p = highest_bid_; p >= order.price && avail < order.quantity;
+                     p -= tick_size_) {
+                    PriceLevel *lvl = bids_.get_level(p);
+                    if (lvl != nullptr) {
+                        avail += lvl->total_quantity;
+                    }
+                    if (p <= min_price_) {
+                        break;
+                    }
+                }
+            }
+            if (avail < order.quantity) {
+                return 0; // insufficient liquidity, cancel FOK
+            }
+        }
+
         if (order.side == Side::BUY) {
             matched = match_buy(order);
         } else {
             matched = match_sell(order);
+        }
+
+        // IOC/FOK: discard remainder (never rest)
+        if (order.type == OrderType::IOC || order.type == OrderType::FOK) {
+            return matched;
         }
 
         if (order.quantity == 0) {
@@ -221,25 +255,24 @@ class OrderBook {
             return matched;
         }
 
-        order_lookup_.add_order(order.order_id, node);
+        order_lookup_.add_order(order.order_id, node_pool_.index_of(node));
         return matched;
     }
 
     void on_cancel_order(const Order &order) {
-        OrderNode *node = order_lookup_.get_order(order.order_id);
-        if (node == nullptr) {
+        uint32_t idx = order_lookup_.get_order(order.order_id);
+        if (idx == OrderNode::NULL_IDX) {
             return;
         }
-
-        PriceLevel *level = node->price_level;
+        OrderNode &node = node_pool_.get(idx);
+        PriceLevel *level = node.price_level;
         if (level != nullptr) {
-            level->total_quantity -= node->quantity;
-            unlink_from_level(level, node);
+            level->total_quantity -= node.quantity;
+            unlink_from_level(level, &node);
         }
-
         order_lookup_.remove_order(order.order_id);
-        node->reset();
-        node_pool_.deallocate(node);
+        node.reset();
+        node_pool_.deallocate(&node);
     }
 
   public:
@@ -262,6 +295,10 @@ class OrderBook {
             return 0;
         case OrderType::MODIFY:
             on_cancel_order(order);
+            return on_new_order(order);
+        case OrderType::IOC:
+            return on_new_order(order);
+        case OrderType::FOK:
             return on_new_order(order);
         }
         return 0;

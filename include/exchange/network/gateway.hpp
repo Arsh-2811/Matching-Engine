@@ -30,14 +30,18 @@ class Gateway {
         }
     }
 
-    ~Gateway() {
-        // In a real system, you'd implement a graceful stop
-        // using an atomic flag in the worker run loop.
+    void stop() {
+        for (auto &w : workers_) {
+            w->stop();
+        }
         for (auto &t : worker_threads_) {
-            if (t.joinable())
-                t.detach();
+            if (t.joinable()) {
+                t.join();
+            }
         }
     }
+
+    ~Gateway() { stop(); }
 };
 
 } // namespace exchange::network

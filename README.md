@@ -1,6 +1,6 @@
 # Matching Engine
 
-A low-latency financial matching engine with price-time priority order matching. Achieves **10+ M orders/sec** throughput on a 4-core i5-9300H with sub-millisecond latency at sustainable rates.
+A low-latency financial matching engine with price-time priority order matching. Achieves **15+ M orders/sec** throughput on a 4-core i5-9300H with sub-millisecond latency at sustainable rates.
 
 ## Build & Run
 
@@ -24,32 +24,33 @@ python3 tests/param_sweep.py --duration 30
 
 ``` text
 Load Generator (4 client threads)
-    │  TCP, SBE binary, rdtsc() timestamps, BATCH_SIZE=16 orders/send()
+    │  TCP, SBE binary, rdtsc() timestamps, BATCH_SIZE=64 orders/send()
 GatewayWorkers (cores 2,3) — epoll edge-triggered, TCP_NODELAY
     │
 MpscQueue [inbound] — lock-free ring buffer, 2M slots
     │
-MatchingEngine (core 1) — single consumer, rdtsc() hot path
+MatchingEngine (core 1) — single consumer, batch drain (64/iter), rdtsc() hot path
     │  OrderBook: price-time priority, uint32_t slab indices, prefetch
     │  process_order() → matched_qty
 SpmcBroadcastQueue [outbound] — 1M slots, cached min-cursor fast path
     │
-MetricsThread (core 3) — LatencyHistogram (P50/P99/P99.9), 1s prints
+MetricsThread (core 3) — LatencyHistogram 512 buckets (P50/P99/P99.9), 1s prints
 ```
 
 ## Performance (i5-9300H, 2.4 GHz, 4 cores, no isolcpus)
 
-| Config | Mean Tput | P50 Tput | Mean Lat | P99 Lat |
-| --- | --- | --- | --- | --- |
-| BATCH=32, Q=2M, unlimited | **10.08M/s** | **10.77M/s** | high (queue backlog) | — |
-| BATCH=64, Q=2M, unlimited | 9.83M/s | 10.41M/s | high | — |
-| BATCH=16, Q=2M, unlimited | 6.54M/s* | 7.17M/s | high | — |
-| BATCH=64, Q=2M, 1400k/client | 5.56M/s | — | 1.6ms | 13.8ms |
-| BATCH=16, Q=2M, 1400k/client | 5.38M/s | — | 0.97ms | 2.1ms |
-| BATCH=8, Q=2M, 1400k/client | 2.99M/s | — | **0.55ms** | **1.1ms** |
+With `-march=native -O3 -flto`, batch drain loop, intrusive slab free list, and sub-bucket histogram.
 
-\* B16 mean suppressed by a single OS scheduling event (p50 = 7.17M/s is representative).
+| Config | Mean Tput | P50 Tput | Mean Lat |
+| --- | --- | --- | --- |
+| **BATCH=64, Q=2M, unlimited** | **15.28M/s** | **15.60M/s** | high (queue backlog) |
+| BATCH=32, Q=2M, unlimited | 11.27M/s | 11.19M/s | high |
+| BATCH=16, Q=2M, unlimited | 11.60M/s | 11.74M/s | high |
+| BATCH=8, Q=2M, unlimited | 6.61M/s | 6.83M/s | high |
+| BATCH=64, Q=2M, 1400k/client | 5.57M/s | — | 0.99ms |
+| BATCH=64, Q=2M, 1000k/client | 4.00M/s | — | 1.56ms |
+
 At unlimited rate, latency is queueing delay, not engine processing time.
-**Recommended**: BATCH=32 for max throughput; BATCH=8 or BATCH=16 at 1400k/client for sub-ms latency.
+**Recommended**: BATCH=64 for max throughput.
 
-Unit-test deep-book benchmark (no TCP): ~6.45M/s at 155 ns/order.
+Unit-test benchmarks (no TCP): deep-book ~6.45M/s at 155 ns/order; thin-book >5M/s.

@@ -2,6 +2,7 @@
 
 #include "exchange/common/tsc.hpp"
 #include "exchange/engine/order_book.hpp"
+#include "exchange/engine/symbol_router.hpp"
 #include "exchange/engine/types.hpp"
 #include "exchange/queue/mpsc_queue.hpp"
 #include "exchange/queue/spmc_broadcast_queue.hpp"
@@ -23,13 +24,18 @@ namespace exchange::engine {
 
 class MatchingEngine {
   private:
+    static constexpr int DRAIN_BATCH = 64;
+
     queue::MpscQueue<Order> &incoming_queue_;
     OrderBook &order_book_;
     // Optional outbound queue for ORDER_PROCESSED events. nullptr in unit-test
     // contexts — no events are emitted and all stat tracking is skipped.
     queue::SpmcBroadcastQueue<OutboundEvent> *outbound_;
+    // Optional symbol router for multi-instrument support. nullptr = single book.
+    SymbolRouter *router_;
 
     std::atomic<bool> is_running_{false};
+    std::atomic<uint64_t> outbound_drops_{0};
     std::thread engine_thread_;
 
     void run(int core_id) {
@@ -38,30 +44,37 @@ class MatchingEngine {
         CPU_SET(core_id, &cpuset);
         pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
 
-        Order current_order;
+        // NOLINTNEXTLINE(modernize-avoid-c-arrays)
+        Order buf[DRAIN_BATCH];
         while (is_running_.load(std::memory_order_acquire)) {
-            if (incoming_queue_.pop(current_order)) {
-                // Poison pill: order_id == 0 signals graceful shutdown.
-                if (current_order.order_id == 0) {
-                    break;
+            int num_drained = 0;
+            while (num_drained < DRAIN_BATCH && incoming_queue_.pop(buf[num_drained])) {
+                ++num_drained;
+            }
+            if (num_drained == 0) {
+                ENGINE_CPU_PAUSE();
+                continue;
+            }
+            for (int i = 0; i < num_drained; ++i) {
+                if (buf[i].order_id == 0) {
+                    is_running_.store(false, std::memory_order_release);
+                    return;
                 }
-
-                // Capture TSC before processing to measure queue-to-match latency.
                 uint64_t process_tsc = rdtsc();
-                uint32_t matched_qty = order_book_.process_order(current_order);
-
+                OrderBook *book =
+                    (router_ != nullptr) ? router_->get_book(buf[i].symbol_id) : &order_book_;
+                uint32_t matched_qty = (book != nullptr) ? book->process_order(buf[i]) : 0;
                 if (outbound_ != nullptr) {
                     OutboundEvent event;
-                    event.type = OutboundEventType::ORDER_PROCESSED;
-                    event.order_processed.order_id = current_order.order_id;
-                    event.order_processed.entry_tsc = current_order.timestamp_tsc;
-                    event.order_processed.process_tsc = process_tsc;
-                    event.order_processed.matched_qty = matched_qty;
+                    event.order_id = buf[i].order_id;
+                    event.entry_tsc = buf[i].timestamp_tsc;
+                    event.process_tsc = process_tsc;
+                    event.matched_qty = matched_qty;
                     // Drop on full — metrics miss a tick, engine never stalls.
-                    outbound_->push(event);
+                    if (!outbound_->push(event)) {
+                        outbound_drops_.fetch_add(1, std::memory_order_relaxed);
+                    }
                 }
-            } else {
-                ENGINE_CPU_PAUSE();
             }
         }
         is_running_.store(false, std::memory_order_release);
@@ -69,8 +82,9 @@ class MatchingEngine {
 
   public:
     explicit MatchingEngine(queue::MpscQueue<Order> &queue, OrderBook &book,
-                            queue::SpmcBroadcastQueue<OutboundEvent> *outbound = nullptr)
-        : incoming_queue_(queue), order_book_(book), outbound_(outbound) {}
+                            queue::SpmcBroadcastQueue<OutboundEvent> *outbound = nullptr,
+                            SymbolRouter *router = nullptr)
+        : incoming_queue_(queue), order_book_(book), outbound_(outbound), router_(router) {}
 
     MatchingEngine(const MatchingEngine &) = delete;
     MatchingEngine &operator=(const MatchingEngine &) = delete;
@@ -87,12 +101,14 @@ class MatchingEngine {
     }
 
     void stop() {
-        if (is_running_.load(std::memory_order_acquire)) {
-            is_running_.store(false, std::memory_order_release);
-            if (engine_thread_.joinable()) {
-                engine_thread_.join();
-            }
+        is_running_.store(false, std::memory_order_release);
+        if (engine_thread_.joinable()) {
+            engine_thread_.join();
         }
+    }
+
+    [[nodiscard]] auto outbound_drops() const -> uint64_t {
+        return outbound_drops_.load(std::memory_order_relaxed);
     }
 };
 

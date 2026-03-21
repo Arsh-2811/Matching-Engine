@@ -63,3 +63,27 @@ TEST(MatchingEngineTest, ConsumeOrdersFromQueue) {
     Order popped_order{};
     EXPECT_FALSE(order_queue.pop(popped_order));
 }
+
+TEST(MatchingEngineTest, PoisonPillExitJoinsCleanly) {
+    constexpr std::size_t QUEUE_CAP = 1024;
+    constexpr std::size_t BOOK_MAX = 100;
+    constexpr std::size_t BOOK_MIN_P = 100;
+    constexpr std::size_t BOOK_MAX_P = 200;
+    constexpr std::size_t BOOK_TICK = 1;
+    constexpr int WAIT_MS = 100;
+
+    MpscQueue<Order> queue(QUEUE_CAP);
+    OrderBook book{BOOK_MAX, BOOK_MIN_P, BOOK_MAX_P, BOOK_TICK};
+    {
+        MatchingEngine engine(queue, book);
+        engine.start(0);
+        Order poison{};
+        poison.order_id = 0;
+        while (!queue.push(poison)) {
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(WAIT_MS));
+        // engine goes out of scope here — destructor calls stop()
+        // if bug exists, std::terminate() is called
+    }
+    SUCCEED(); // reached here without crash
+}

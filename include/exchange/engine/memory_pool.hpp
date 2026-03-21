@@ -9,7 +9,8 @@ namespace exchange::engine {
 template <typename T> class MemoryPool {
   private:
     std::vector<T> buffer_;
-    std::vector<T *> free_list_;
+    uint32_t free_head_{T::NULL_IDX};
+    std::size_t available_{0};
 
   public:
     explicit MemoryPool(std::size_t capacity) {
@@ -17,11 +18,12 @@ template <typename T> class MemoryPool {
             throw std::invalid_argument("Pool Capacity must be greater than 0");
         }
         buffer_.resize(capacity);
-        free_list_.reserve(capacity);
-
-        for (std::size_t i = capacity; i > 0; i--) {
-            free_list_.push_back((&buffer_[i - 1]));
+        // Build the intrusive free list: each node points to the next one.
+        for (std::size_t i = capacity; i > 0; --i) {
+            buffer_[i - 1].next_idx = (i < capacity) ? static_cast<uint32_t>(i) : T::NULL_IDX;
         }
+        free_head_ = 0;
+        available_ = capacity;
     }
 
     MemoryPool(const MemoryPool &) = delete;
@@ -31,21 +33,26 @@ template <typename T> class MemoryPool {
     ~MemoryPool() = default;
 
     [[nodiscard]] auto allocate() -> T * {
-        if (free_list_.empty()) {
+        if (free_head_ == T::NULL_IDX) {
             return nullptr;
         }
-        T *obj = free_list_.back();
-        free_list_.pop_back();
+        T *obj = &buffer_[free_head_];
+        free_head_ = obj->next_idx;
+        obj->next_idx = T::NULL_IDX;
+        --available_;
         return obj;
     }
 
     void deallocate(T *obj) {
-        if (obj != nullptr) {
-            free_list_.push_back(obj);
+        if (obj == nullptr) {
+            return;
         }
+        obj->next_idx = free_head_;
+        free_head_ = index_of(obj);
+        ++available_;
     }
 
-    [[nodiscard]] auto available() const -> std::size_t { return free_list_.size(); }
+    [[nodiscard]] auto available() const -> std::size_t { return available_; }
 
     // Direct index-based access into the contiguous slab.
     [[nodiscard]] auto get(uint32_t idx) -> T & { return buffer_[idx]; }

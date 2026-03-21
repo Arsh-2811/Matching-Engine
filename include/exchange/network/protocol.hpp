@@ -2,7 +2,13 @@
 #include <cstdint>
 
 namespace exchange::network {
-enum class MsgType : uint16_t { NEW_ORDER = 1, CANCEL_ORDER = 2, MODIFY_ORDER = 3 };
+enum class MsgType : uint16_t {
+    NEW_ORDER = 1,
+    CANCEL_ORDER = 2,
+    MODIFY_ORDER = 3,
+    IOC_ORDER = 4,
+    FOK_ORDER = 5
+};
 
 struct [[gnu::packed]] MsgHeader {
     uint16_t msg_size; // Includes Header + Payload

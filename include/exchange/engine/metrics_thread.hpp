@@ -4,6 +4,7 @@
 #include "exchange/common/tsc.hpp"
 #include "exchange/engine/latency_histogram.hpp"
 #include "exchange/engine/types.hpp"
+#include "exchange/queue/mpsc_queue.hpp"
 #include "exchange/queue/spmc_broadcast_queue.hpp"
 #include <atomic>
 #include <chrono>
@@ -32,6 +33,7 @@ class MetricsThread {
     static constexpr uint64_t TIME_CHECK_INTERVAL = uint64_t{1} << 16; // 65536
 
     queue::SpmcBroadcastQueue<OutboundEvent> &outbound_queue_;
+    const queue::MpscQueue<engine::Order> *inbound_queue_{nullptr};
     std::atomic<bool> is_running_{false};
     std::thread thread_;
     int consumer_id_{-1};
@@ -57,23 +59,19 @@ class MetricsThread {
         while (is_running_.load(std::memory_order_acquire)) {
             OutboundEvent event;
             if (outbound_queue_.pop(consumer_id_, event)) {
-                if (event.type == OutboundEventType::ORDER_PROCESSED) {
-                    ++order_count;
-                    if (event.order_processed.matched_qty > 0) {
-                        ++matched_orders;
-                        total_matched_qty += event.order_processed.matched_qty;
+                ++order_count;
+                if (event.matched_qty > 0) {
+                    ++matched_orders;
+                    total_matched_qty += event.matched_qty;
+                }
+                // Record latency only when the sender provided a valid stamp.
+                if (event.entry_tsc > 0 && event.process_tsc > event.entry_tsc) {
+                    uint64_t lat = event.process_tsc - event.entry_tsc;
+                    total_latency_tsc += lat;
+                    if (lat > max_latency_tsc) {
+                        max_latency_tsc = lat;
                     }
-                    // Record latency only when the sender provided a valid stamp.
-                    if (event.order_processed.entry_tsc > 0 &&
-                        event.order_processed.process_tsc > event.order_processed.entry_tsc) {
-                        uint64_t lat =
-                            event.order_processed.process_tsc - event.order_processed.entry_tsc;
-                        total_latency_tsc += lat;
-                        if (lat > max_latency_tsc) {
-                            max_latency_tsc = lat;
-                        }
-                        lat_hist.record(lat);
-                    }
+                    lat_hist.record(lat);
                 }
             } else {
                 // Yield so the gateway worker sharing this core gets CPU time.
@@ -92,6 +90,7 @@ class MetricsThread {
                 std::chrono::duration_cast<std::chrono::seconds>(now - last_print).count();
             if (elapsed_s >= 1) {
                 if (order_count > 0) {
+                    std::size_t q_depth = (inbound_queue_ != nullptr) ? inbound_queue_->size() : 0;
                     uint64_t lat_samples = lat_hist.sample_count;
                     double avg_lat_ns = (lat_samples > 0)
                                             ? (static_cast<double>(total_latency_tsc) /
@@ -105,7 +104,8 @@ class MetricsThread {
                     double fill_rate = static_cast<double>(matched_orders) /
                                        static_cast<double>(order_count) * 100.0;
                     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg)
-                    std::printf("Throughput: %llu orders/s"
+                    std::printf("Queue Depth: %zu"
+                                " | Throughput: %llu orders/s"
                                 " | Avg Latency: %.1f ns"
                                 " | P50 Latency: %.1f ns"
                                 " | P99 Latency: %.1f ns"
@@ -113,7 +113,7 @@ class MetricsThread {
                                 " | Max Latency: %.1f ns"
                                 " | Fill Rate: %.1f%%"
                                 " | Volume: %llu\n",
-                                static_cast<unsigned long long>(order_count), avg_lat_ns,
+                                q_depth, static_cast<unsigned long long>(order_count), avg_lat_ns,
                                 p50_lat_ns, p99_lat_ns, p999_lat_ns, max_lat_ns, fill_rate,
                                 static_cast<unsigned long long>(total_matched_qty));
                     std::fflush(stdout);
@@ -134,8 +134,9 @@ class MetricsThread {
     // Calibrates TSC and registers as a consumer immediately at construction.
     // Must be constructed BEFORE the engine thread is started so that
     // register_consumer() runs before any push() calls.
-    explicit MetricsThread(queue::SpmcBroadcastQueue<OutboundEvent> &outbound)
-        : outbound_queue_(outbound) {
+    explicit MetricsThread(queue::SpmcBroadcastQueue<OutboundEvent> &outbound,
+                           const queue::MpscQueue<engine::Order> *inbound = nullptr)
+        : outbound_queue_(outbound), inbound_queue_(inbound) {
         ns_per_cycle_ = common::calibrate_tsc_ns_per_cycle(config::engine::TSC_CALIBRATION_MS);
         consumer_id_ = outbound_queue_.register_consumer();
     }
@@ -155,11 +156,9 @@ class MetricsThread {
     }
 
     void stop() {
-        if (is_running_.load(std::memory_order_acquire)) {
-            is_running_.store(false, std::memory_order_release);
-            if (thread_.joinable()) {
-                thread_.join();
-            }
+        is_running_.store(false, std::memory_order_release);
+        if (thread_.joinable()) {
+            thread_.join();
         }
     }
 };

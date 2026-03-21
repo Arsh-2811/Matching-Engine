@@ -92,7 +92,8 @@ TEST(SystemBenchmark, ThroughputStressTest) {
     }
 
     // Push the POISON PILL (order_id = 0) to tell the engine to stop
-    while (!queue.push({0, 0, 0, Side::BUY, OrderType::NEW})) {
+    while (!queue.push(
+        {.order_id = 0, .price = 0, .quantity = 0, .side = Side::BUY, .type = OrderType::NEW})) {
     }
 
     engine.stop();
@@ -117,4 +118,75 @@ TEST(SystemBenchmark, ThroughputStressTest) {
     std::cout << "=========================================\n\n";
 
     EXPECT_LT(book.get_available_capacity(), BOOK_CAPACITY);
+}
+
+TEST(SystemBenchmark, ThinBookThroughput) {
+    constexpr std::size_t NUM_ORDERS = 4'000'000;
+    constexpr std::size_t QUEUE_CAPACITY = 1 << 23; // 8M
+    constexpr std::size_t BOOK_CAPACITY = NUM_ORDERS + 10;
+    constexpr std::size_t MIN_PRICE = 1;
+    constexpr std::size_t MAX_PRICE = 10000;
+    constexpr std::size_t TICK_SIZE = 1;
+    constexpr uint64_t MID_INIT = 1000;
+    constexpr uint64_t MID_MIN = 500;
+    constexpr uint64_t MID_MAX = 1500;
+    constexpr uint64_t OFFSET = 2;
+    constexpr uint32_t ORDER_DEFAULT_QTY = 10;
+    constexpr std::size_t NANOS_PER_SECOND = 1'000'000'000;
+    constexpr auto ID_RANGE = static_cast<uint64_t>(NUM_ORDERS);
+
+    MpscQueue<Order> queue(QUEUE_CAPACITY);
+    OrderBook book(BOOK_CAPACITY, MIN_PRICE, MAX_PRICE, TICK_SIZE);
+    MatchingEngine engine(queue, book);
+
+    // Pre-generate thin-book orders (aggressive BUY/SELL alternating)
+    std::vector<Order> orders;
+    orders.reserve(NUM_ORDERS);
+    uint64_t mid = MID_INIT;
+    for (std::size_t i = 0; i < NUM_ORDERS; ++i) {
+        bool is_buy = (i % 2 == 0);
+        uint64_t price = is_buy ? mid + OFFSET : mid - OFFSET;
+        uint64_t oid = (i % ID_RANGE) + 1;
+        orders.push_back({.order_id = oid,
+                          .price = price,
+                          .quantity = ORDER_DEFAULT_QTY,
+                          .side = is_buy ? Side::BUY : Side::SELL,
+                          .type = OrderType::NEW});
+        // Walk mid price by ±1 each pair
+        if (i % 2 == 1) {
+            if (mid < MID_MAX) {
+                ++mid;
+            } else if (mid > MID_MIN) {
+                --mid;
+            }
+        }
+    }
+
+    engine.start(0);
+    auto start_time = std::chrono::high_resolution_clock::now();
+
+    for (const auto &order : orders) {
+        while (!queue.push(order)) {
+        }
+    }
+    while (!queue.push(
+        {.order_id = 0, .price = 0, .quantity = 0, .side = Side::BUY, .type = OrderType::NEW})) {
+    }
+    engine.stop();
+
+    auto end_time = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> elapsed = end_time - start_time;
+    double orders_per_sec = NUM_ORDERS / elapsed.count();
+    double ns_per_order = (elapsed.count() * NANOS_PER_SECOND) / NUM_ORDERS;
+
+    std::cout << "\n=========================================\n";
+    std::cout << " THIN-BOOK BENCHMARK RESULTS\n";
+    std::cout << "=========================================\n";
+    std::cout << " Orders Processed: " << NUM_ORDERS << "\n";
+    std::cout << " Time Elapsed:     " << elapsed.count() << " seconds\n";
+    std::cout << " Throughput:       " << static_cast<uint64_t>(orders_per_sec) << " orders/sec\n";
+    std::cout << " Average Latency:  " << ns_per_order << " ns/order\n";
+    std::cout << "=========================================\n\n";
+
+    EXPECT_GT(orders_per_sec, 5'000'000.0); // expect > 5M/s (thin-book is fast)
 }

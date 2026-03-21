@@ -23,9 +23,18 @@ target_compile_options(core PRIVATE
     -Wall
     -Wextra
     -Wpedantic
+    $<$<CONFIG:Release>:-O3 -march=native -flto>
+)
+target_link_options(core PRIVATE
+    $<$<CONFIG:Release>:-flto>
 )
 
 target_include_directories(core PUBLIC include)
+
+target_compile_options(exchange_app PRIVATE $<$<CONFIG:Release>:-O3 -march=native -flto>)
+target_compile_options(load_gen     PRIVATE $<$<CONFIG:Release>:-O3 -march=native -flto>)
+target_link_options(exchange_app    PRIVATE $<$<CONFIG:Release>:-flto>)
+target_link_options(load_gen        PRIVATE $<$<CONFIG:Release>:-flto>)
 
 target_link_libraries(exchange_app core)
 target_link_libraries(load_gen core)
