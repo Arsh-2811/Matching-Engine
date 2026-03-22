@@ -3,3 +3,4 @@ compile_commands.json
 .cache/
 codebase_context.txt
 tests/results/
+.claude/
