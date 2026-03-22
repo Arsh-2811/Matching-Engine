@@ -8,65 +8,33 @@ jobs:
   # ── 1. Release build + correctness tests + format check ──────────────────────
   build:
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install dependencies
-        run: |
-          sudo apt-get update -q
-          sudo apt-get install -y \
-            build-essential \
-            cmake \
-            clang \
-            clang-format
-
-      - name: Cache GoogleTest
-        uses: actions/cache@v4
+      - uses: ./.github/actions/cpp-build
         with:
-          path: build/_deps
-          key: gtest-${{ hashFiles('CMakeLists.txt') }}
-
-      - name: Configure (Release)
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-
-      - name: Build
-        run: cmake --build build --parallel
+          build-type: Release
+          extra-packages: clang clang-format
 
       - name: Run correctness tests
-        run: ctest --test-dir build --output-on-failure -E "Benchmark"
+        run: ctest --test-dir build --output-on-failure --timeout 120 -E "Benchmark"
 
       - name: Check formatting
-        run: |
-          git ls-files '*.cpp' '*.hpp' | xargs clang-format --dry-run --Werror
+        run: git ls-files '*.cpp' '*.hpp' | xargs clang-format --dry-run --Werror
 
   # ── 2. Benchmarks (informational — failure does not block merge) ───────────
   benchmarks:
     runs-on: ubuntu-latest
     continue-on-error: true   # shared-runner jitter makes hard thresholds unreliable
-
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install dependencies
-        run: |
-          sudo apt-get update -q
-          sudo apt-get install -y build-essential cmake
-
-      - name: Cache GoogleTest
-        uses: actions/cache@v4
+      - uses: ./.github/actions/cpp-build
         with:
-          path: build/_deps
-          key: gtest-${{ hashFiles('CMakeLists.txt') }}
-
-      - name: Configure (Release)
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-
-      - name: Build
-        run: cmake --build build --parallel
+          build-type: Release
 
       - name: Run benchmarks
-        run: ctest --test-dir build --output-on-failure -R "Benchmark"
+        run: ctest --test-dir build --output-on-failure --timeout 120 -R "Benchmark"
 
   # ── 3. Sanitizers — correctness only, no performance assertions ───────────
   sanitizers:
@@ -74,58 +42,30 @@ jobs:
     env:
       CC: clang
       CXX: clang++
-
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install dependencies
-        run: |
-          sudo apt-get update -q
-          sudo apt-get install -y build-essential cmake clang
-
-      - name: Cache GoogleTest
-        uses: actions/cache@v4
+      - uses: ./.github/actions/cpp-build
         with:
-          path: build/_deps
-          key: gtest-${{ hashFiles('CMakeLists.txt') }}
-
-      - name: Configure (Debug + ASan + UBSan)
-        run: |
-          cmake -S . -B build \
-            -DCMAKE_BUILD_TYPE=Debug \
-            -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined" \
+          build-type: Debug
+          extra-packages: clang
+          cmake-flags: >-
+            -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined"
             -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
 
-      - name: Build
-        run: cmake --build build --parallel
-
       - name: Run correctness tests (benchmarks excluded)
-        run: ctest --test-dir build --output-on-failure -E "Benchmark"
+        run: ctest --test-dir build --output-on-failure --timeout 120 -E "Benchmark"
 
   # ── 4. clang-tidy static analysis ─────────────────────────────────────────
   tidy:
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install dependencies
-        run: |
-          sudo apt-get update -q
-          sudo apt-get install -y \
-            build-essential \
-            cmake \
-            clang \
-            clang-tidy
-
-      - name: Cache GoogleTest
-        uses: actions/cache@v4
+      - uses: ./.github/actions/cpp-build
         with:
-          path: build/_deps
-          key: gtest-${{ hashFiles('CMakeLists.txt') }}
-
-      - name: Configure
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+          build-type: Debug
+          extra-packages: clang clang-tidy
 
       - name: Run clang-tidy
         run: ./scripts/run_clang_tidy.sh

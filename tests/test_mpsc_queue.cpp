@@ -94,6 +94,8 @@ TEST(MpscQueueTest, MultiThreadedStressTest) {
         while (items_consumed.load() < TOTAL_ITEMS) {
             if (queue.pop(item)) {
                 items_consumed.fetch_add(1);
+            } else {
+                std::this_thread::yield();
             }
         }
     });
@@ -103,6 +105,7 @@ TEST(MpscQueueTest, MultiThreadedStressTest) {
         producers.emplace_back([&queue, ITEMS_PER_PRODUCER]() {
             for (std::size_t j = 0; j < ITEMS_PER_PRODUCER; j++) {
                 while (!queue.push(1)) {
+                    std::this_thread::yield();
                 }
             }
         });
@@ -138,6 +141,8 @@ TEST(MpscQueueBenchmark, Throughput) {
         while (items_consumed.load(std::memory_order_relaxed) < TOTAL_MESSAGES) {
             if (queue.pop(item)) {
                 items_consumed.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                CPU_PAUSE();
             }
         }
     });
@@ -151,7 +156,7 @@ TEST(MpscQueueBenchmark, Throughput) {
 
             for (std::size_t j = 0; j < MESSAGES_PER_PRODUCER; ++j) {
                 while (!queue.push(1)) {
-                    // Spin-wait if the queue is full
+                    CPU_PAUSE();
                 }
             }
         });

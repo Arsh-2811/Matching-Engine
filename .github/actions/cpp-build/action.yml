@@ -1,0 +1,36 @@
+name: C++ Setup and Build
+description: Install deps, cache GoogleTest, configure CMake, and build.
+
+inputs:
+  build-type:
+    description: CMake build type (Release or Debug)
+    required: true
+  cmake-flags:
+    description: Extra CMake flags (e.g. -DCMAKE_CXX_FLAGS="...")
+    default: ''
+  extra-packages:
+    description: Space-separated apt packages beyond build-essential and cmake
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - name: Install dependencies
+      shell: bash
+      run: |
+        sudo apt-get update -q
+        sudo apt-get install -y build-essential cmake ${{ inputs.extra-packages }}
+
+    - name: Cache GoogleTest
+      uses: actions/cache@v4
+      with:
+        path: build/_deps
+        key: gtest-${{ hashFiles('CMakeLists.txt') }}
+
+    - name: Configure
+      shell: bash
+      run: cmake -S . -B build -DCMAKE_BUILD_TYPE=${{ inputs.build-type }} ${{ inputs.cmake-flags }}
+
+    - name: Build
+      shell: bash
+      run: cmake --build build --parallel
