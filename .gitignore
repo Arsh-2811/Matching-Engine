@@ -4,3 +4,9 @@ compile_commands.json
 codebase_context.txt
 tests/results/
 .claude/
+
+CLAUDE.md
+.mcp.json
+
+# Helper scripts
+gather_context.sh
