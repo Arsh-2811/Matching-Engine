@@ -1617,7 +1617,251 @@ The large gap between the individual steps and the measured end-to-end latency a
 
 ---
 
-*End of LEARNING.md — Version 1.0*
+## 17. Throughput vs Latency — The Rate-Limit Sweet Spot
 
-*This document covers every component used in this codebase from first principles.*
-*Use it as a reference as you re-read the source files. For each concept, find it in the code and trace through the logic yourself.*
+### The fundamental tradeoff
+
+Throughput and latency measure different things and you cannot maximise both at once.
+
+**Throughput** = how many orders the engine processes per second. This is the engine's raw capacity — a property of the hardware and code, not the input rate.
+
+**Latency** = how long a single order waits from the moment the load gen builds it (`rdtsc()` in `tests/load_generator.cpp:164`) to the moment the engine processes it (`matching_engine.hpp:78`). This is dominated by **queue depth**, not engine speed.
+
+### What happens at unlimited rate
+
+The load gen sends as fast as the TCP socket allows. The engine processes at its ceiling (~14M/s on master). Because both ends run at similar speeds, the MpscQueue (2M slots) fills up permanently.
+
+An order entering the back of a full queue has to wait for ~2M orders ahead of it. At 14M/s: `2,000,000 / 14,000,000 = 143ms`. That is why unlimited P50 latency is ~145ms — it is pure queueing delay, not engine overhead.
+
+GatewayWorker at `src/network/worker.cpp:130`:
+```cpp
+while (!incoming_queue_.push(internal_order)) { }  // spin-waits when queue full
+```
+
+### What happens at rate-limited
+
+The token bucket in `tests/load_generator.cpp:51-61` only releases a batch of tokens every `BATCH_SIZE / rate_per_sec` seconds. The load gen spins on `CPU_PAUSE()` between releases.
+
+With 4 clients at 1.4M/s = 5.6M orders/s total, the engine can do 14M/s. The engine is always faster than the load gen. The queue is almost always empty. Each order arrives, gets processed immediately, ACK returns. P50 latency ≈ TCP round trip + processing = ~0.05ms on master.
+
+### The latency cliff
+
+If you keep increasing the rate, eventually the load gen matches the engine's speed. The queue starts filling. Latency jumps exponentially. This jump is called the **latency cliff**.
+
+From the rate sweep (master branch, BATCH=64, 4 clients):
+
+| Rate/client | Total | Throughput | P50 Latency |
+|---|---|---|---|
+| 1700k | 6.8M/s | 6.83M/s | 0.05ms |
+| **2000k** | **8M/s** | **7.98M/s** | **5.68ms** ← cliff |
+| 2500k | 10M/s | 8.13M/s | 14ms |
+
+The **sweet spot** is the highest rate just before the cliff. At this point you get the most throughput while keeping the queue empty.
+
+### Why the cliff moves between branches
+
+The feature branch (cancel/ACK + maker fills) adds overhead per order. The engine's effective capacity drops from ~14M/s to ~7M/s. At the same input rate, the queue fills faster. So the cliff shifts from 2000k/client (master) to 1700k/client (feature branch).
+
+The `tests/rate_sweep_plot.py` script automates this analysis — it sweeps rate limits, measures throughput and P50 latency, and draws the graph so you can see the cliff visually.
+
+---
+
+## 18. BATCH_SIZE — Syscall Cost vs Latency Floor
+
+### Why batching exists
+
+Every `send()` call is a **syscall** — a request to the operating system to do something on your behalf. Syscalls are expensive: the CPU must switch from user mode to kernel mode and back, costing ~1–2 microseconds each.
+
+If BATCH_SIZE=1, each order triggers a separate `send()`. At 14M orders/s that is 14M syscalls/s × 2µs = 28 seconds of CPU time per second — impossible.
+
+BATCH_SIZE=64 packs 64 × 32 bytes = 2048 bytes into one `send()`. One syscall to deliver 64 orders. Cost = 2µs / 64 = 31ns per order equivalent — negligible.
+
+See `tests/load_generator.cpp:25-26`:
+```cpp
+static constexpr std::size_t BATCH_BYTES = SINGLE_MSG_SIZE * BATCH_SIZE;
+// ... then at line 179:
+send(sock, batch_buf, BATCH_BYTES, 0);  // one syscall for all BATCH_SIZE orders
+```
+
+### The latency floor
+
+Order #1 in a batch gets its `rdtsc()` timestamp the instant it is built. But it does not get sent until all 64 orders in the batch are built and `send()` is called. Order #1 therefore waits for orders #2–#64 to be built before going on the wire.
+
+At ~14M orders/s per client, building one order takes ~70ns. Building 63 more = ~4.4µs. This is the **batching latency floor** — an order can never be acknowledged faster than the time to fill one batch.
+
+At 1.4M/client rate-limited, the token bucket pause between batches is `64/1,400,000 = 45.7µs`. The within-batch delay (4.4µs) is negligible on top of that. So BATCH=64 has no measurable latency penalty at this rate.
+
+But in a real production system you would not batch at the network layer at all — you would send each order immediately (BATCH=1) and accept the syscall cost, or use kernel bypass (DPDK/RDMA) to eliminate syscalls entirely.
+
+### Why BATCH=8 collapses
+
+From the sweep: BATCH=8 at 1.4M/client → only 3.46M/s throughput.
+
+With BATCH=8, the load gen calls `send()` 8× more often than with BATCH=64. The load gen itself becomes the bottleneck — it cannot generate orders fast enough because it is spending too much time in syscalls.
+
+| BATCH | Rate | Throughput | P50 Lat |
+|---|---|---|---|
+| 64 | 1400k | 5.60M/s | 0.05ms |
+| 16 | 1400k | 4.86M/s | 0.16ms |
+| 8  | 1400k | 3.46M/s | 44ms |
+
+BATCH=8 collapses because the load gen is syscall-bound and cannot sustain 1.4M/client.
+
+---
+
+## 19. The Cancel/ACK Return Path
+
+### The problem
+
+Before this feature, orders went in (load gen → engine) but nothing came back. The load gen had no way to confirm whether an order was accepted, filled, or rejected.
+
+In a real exchange, every order submission must receive an acknowledgement. The exchange assigns an `ExchangeOrderID` and sends back the fill quantity, remaining quantity, and status (`EventType`).
+
+### Two IDs per order
+
+The system uses two IDs:
+
+1. **`cl_ord_id`** (client order ID): assigned by the load gen. Each client thread generates sequential IDs within its partition (`[client_id × MAX_ORDERS/NUM_CLIENTS + 1, ...]`). The load gen knows this ID.
+
+2. **`ExchangeOrderID`**: assigned by GatewayWorker when the order enters the exchange. This is the ID used internally in the engine's order pool.
+
+Both IDs travel with the order. The engine copies them into every `OutboundEvent`, so when the ACK comes back the client can match it to the original submission.
+
+### EventType
+
+`include/exchange/engine/types.hpp` defines what happened to the order:
+
+```cpp
+enum class EventType : uint8_t {
+    NEW_ACK         = 0,  // order resting on the book
+    PARTIALLY_FILLED = 1, // order partially matched, remainder resting
+    FILLED          = 2,  // order fully matched, nothing resting
+    CANCELLED       = 3,  // cancel request succeeded
+    CANCEL_REJECTED = 4,  // cancel request failed (order not found)
+    MAKER_FILLED    = 5,  // a resting order was filled by an aggressor
+};
+```
+
+### AckThread
+
+`include/exchange/engine/ack_thread.hpp` is a dedicated thread (pinned to core 0) that reads `OutboundEvent` objects and sends `AckMsg` responses back to clients over TCP.
+
+It is registered as a **best-effort consumer** (`register_best_effort_consumer()`) on the SPMC queue. "Best-effort" means: if it falls behind by more than the queue capacity, it skips ahead. It never blocks the engine. The engine must not slow down just because the ACK thread is busy.
+
+To reduce syscalls, AckThread batches ACKs per `client_fd`:
+
+```cpp
+// append_ack() in ack_thread.hpp:44
+auto &buf = send_bufs[ev.client_fd];
+buf.resize(old_size + ACK_MSG_SIZE);
+// ... copy header + ack into buf ...
+if (++events_since_flush >= ACK_BATCH) {
+    flush_all();  // one send() per client
+}
+```
+
+ACK_BATCH=256 means one `send()` per client every 256 events — ~256× fewer syscalls than one-ACK-per-event.
+
+---
+
+## 20. Maker Fill Notifications
+
+### The problem
+
+When an aggressive order fills a resting order, the resting order's owner (maker) needs to know. With just `FILLED` events for the taker, the maker's client had no way to know their order was consumed.
+
+### MakerFillBuffer
+
+Rather than making the `OrderBook` interact with any queue, a stack-allocated buffer collects fills during matching:
+
+```cpp
+struct MakerFill {
+    uint64_t order_id;
+    uint64_t cl_ord_id;
+    int      client_fd;
+    uint32_t matched_qty;
+    uint32_t leaves_qty;
+};
+
+struct MakerFillBuffer {
+    static constexpr uint8_t MAX = 8;
+    MakerFill fills[MAX];
+    uint8_t   count = 0;
+};
+```
+
+The engine passes a `MakerFillBuffer*` into `process_order()`. During matching, `match_buy`/`match_sell` append fills. After `process_order()` returns, the engine pushes each fill as a separate `OutboundEvent` with `EventType::MAKER_FILLED`.
+
+`MakerFillBuffer` is declared **inside** the per-order loop in `matching_engine.hpp:72`. Moving it outside (to avoid re-initialization per order) caused a measurable regression — the compiler generates better code with it declared inside.
+
+### Cold/hot data separation — node_routing_
+
+The `OrderNode` struct is exactly 32 bytes. Two nodes fit per 64-byte cache line. This matters because during matching, the engine traverses a linked list of nodes — every node access is a potential cache miss.
+
+If we stored `cl_ord_id` and `client_fd` inside `OrderNode`, it would grow to 48 bytes. A 48-byte struct at 8-byte alignment straddles cache line boundaries (e.g., node at byte offset 48 spans bytes 48–95, crossing the 64-byte boundary). Every node access would require fetching **two** cache lines instead of one — double the cache miss cost.
+
+Solution: keep `OrderNode` at 32 bytes and store the cold routing data in a parallel sidecar array (`node_routing_[]` in `OrderBook`), indexed by pool slot. Hot matching data (price level, linked list pointers) stays in the compact node. Cold routing data (needed only when the order is filled) fetched from the sidecar.
+
+### Separate SPMC queue for maker fills
+
+Naively, maker fills could be pushed to the same `outbound_` SPMC queue as taker events. The problem: with 50% fill rate and 10M orders/s, there are ~5M taker events/s + ~5M maker fills/s = 10M events/s. MetricsThread (the only critical consumer on `outbound_`) was only capable of ~7M events/s on core 3. The queue filled up. Every `push()` triggered `get_min_consumer_seq()` — a 50ns cross-core cache coherency access. The engine burned ~500ms/sec of CPU just in backpressure checks, collapsing throughput from 10M/s to ~5M/s.
+
+Fix: a dedicated `SpmcBroadcastQueue` for maker fills with **zero critical consumers**. With no critical consumers, `push()` checks `cached_min_consumer_seq_` (a local non-atomic field — zero cross-core reads). Push cost drops from ~105ns (MpscQueue) to ~12ns (SPMC with 0 critical consumers).
+
+MetricsThread only ever sees taker events. Its event rate stays at the taker-only baseline.
+
+---
+
+## 21. Performance Engineering Lessons from This Project
+
+### Lesson 1: Measure first, then optimise
+
+Every regression in this project had a root cause that wasn't obvious from inspection. The three causes of the maker-fills regression were:
+1. OrderNode cache line straddling (48 bytes → 2 cache misses per node traversal)
+2. MetricsThread SPMC backpressure from 2× event rate
+3. MpscQueue cross-core acquire on every push (not just when full)
+
+None of these were guesses — each was confirmed by measurement showing the throughput recovery after each fix.
+
+### Lesson 2: Every cross-core atomic access costs ~50ns
+
+An `std::atomic<T>::load(std::memory_order_acquire)` that hits a cache line owned by another core forces a cache coherency protocol round trip. On this i5-9300H, that costs ~50ns.
+
+At 10M operations/s, one cross-core read per operation = 500ms/sec of overhead = the CPU is 50% occupied doing nothing but cache coherency. This is why:
+- The SPMC queue caches `min_consumer_seq_` locally (avoids cross-core read on every push in the common case)
+- The maker fill queue uses 0 critical consumers (so `push()` never reads consumer cursors at all)
+- The load gen uses xorshift64 per-thread RNG to avoid `std::rand()` global lock
+
+### Lesson 3: Cache line layout is a first-order concern
+
+A struct that straddles a 64-byte cache line boundary costs 2× cache misses when accessed. With 14M nodes traversed per second, doubling the cache miss rate is a 40% throughput loss.
+
+Rules:
+- Keep hot structs at sizes that are powers of 2 (8, 16, 32, 64 bytes)
+- Separate hot (frequently accessed) and cold (rarely accessed) fields into different structs or parallel arrays
+- 32 bytes = 2 nodes per cache line = optimal for linked list traversal
+
+### Lesson 4: The queue is the engine's clock
+
+At unlimited rate, the throughput you see in MetricsThread is the **engine's ceiling** — the fastest it can process orders. The engine never idles.
+
+At rate-limited, throughput = input rate. The engine idles most of the time. To measure the engine's true capacity you must drive it to saturation (unlimited rate).
+
+To measure true end-to-end latency you must keep the queue empty (rate-limit to 70–80% of capacity). An order in a full queue spends most of its measured latency doing nothing — waiting in line.
+
+### Lesson 5: Token bucket rate limiting is TSC-based
+
+The load gen's `TokenBucket` (`tests/load_generator.cpp:35-68`) accumulates tokens proportional to CPU cycles elapsed since last check:
+
+```cpp
+double elapsed = static_cast<double>(now - last_tsc_);
+tokens_ = std::min(max_tokens_, tokens_ + elapsed * tokens_per_cycle_);
+```
+
+`tokens_per_cycle_` = `rate_hz / tsc_frequency_hz`. This is purely arithmetic — no syscalls, no sleeping. The load gen spin-loops on `CPU_PAUSE()` between batches. This gives very precise rate control but burns CPU.
+
+---
+
+*End of LEARNING.md — Version 2.0*
+
+*Added in Version 2.0: Throughput vs Latency (§17), BATCH_SIZE effects (§18), Cancel/ACK return path (§19), Maker fill notifications (§20), Performance engineering lessons (§21).*
