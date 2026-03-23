@@ -73,6 +73,7 @@ void GatewayWorker::handle_disconnect(int sock_fd) {
         engine::Order cancel{};
         cancel.order_id = exchange_id;
         cancel.type = engine::OrderType::CANCEL;
+        cancel.client_fd = -1; // suppress ACK — client already disconnected
         while (!incoming_queue_.push(cancel)) {
             NET_CPU_PAUSE();
         }
@@ -144,19 +145,24 @@ void GatewayWorker::handle_client_data(int sock_fd) {
                                              .quantity = sbe_order->quantity,
                                              .side = static_cast<engine::Side>(sbe_order->side),
                                              .type = engine::OrderType::NEW,
-                                             .timestamp_tsc = sbe_order->timestamp_tsc};
+                                             .timestamp_tsc = sbe_order->timestamp_tsc,
+                                             .client_fd = sock_fd,
+                                             .cl_ord_id = sbe_order->order_id};
 
                 while (!incoming_queue_.push(internal_order)) {
                     NET_CPU_PAUSE();
                 }
             } else if (header->type == MsgType::CANCEL_ORDER) {
                 // order_id field carries the ExchangeOrderID for cancel.
+                const auto &rte = routing_table_.get(sbe_order->order_id);
                 engine::Order cancel_order{.order_id = sbe_order->order_id,
                                            .price = 0,
                                            .quantity = 0,
                                            .side = engine::Side::BUY,
                                            .type = engine::OrderType::CANCEL,
-                                           .timestamp_tsc = sbe_order->timestamp_tsc};
+                                           .timestamp_tsc = sbe_order->timestamp_tsc,
+                                           .client_fd = sock_fd,
+                                           .cl_ord_id = rte.cl_ord_id};
 
                 while (!incoming_queue_.push(cancel_order)) {
                     NET_CPU_PAUSE();

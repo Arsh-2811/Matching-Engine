@@ -205,20 +205,28 @@ static void drain_acks(int sock, RecvBuffer &rbuf,
             uint8_t event_type = ack->event_type;
             uint64_t eid = ack->exchange_order_id;
 
-            // EventType: 0=NEW_ACK, 1=PARTIALLY_FILLED, 2=FILLED, 3=CANCELLED, 4=CANCEL_REJECTED
+            // EventType: 0=NEW_ACK, 1=PARTIALLY_FILLED, 2=FILLED, 3=CANCELLED, 4=CANCEL_REJECTED,
+            // 5=MAKER_FILLED
             if (event_type == 0 || event_type == 1) {
-                // Order resting — track as live (capped at LIVE_CAP).
+                // NEW_ACK or PARTIALLY_FILLED (as taker) — order resting
                 insert_live(live_map, live_keys, eid, ack->cl_ord_id);
             } else if (event_type == 2 || event_type == 3) {
-                // FILLED or CANCELLED — remove from live tracking.
+                // FILLED or CANCELLED — remove from live tracking
                 erase_live(live_map, live_keys, eid);
                 if (event_type == 3) {
                     ++cancels_acked;
                 }
             } else if (event_type == 4) {
-                // CANCEL_REJECTED — remove defensively.
+                // CANCEL_REJECTED
                 erase_live(live_map, live_keys, eid);
                 ++cancel_rejects;
+            } else if (event_type == 5) {
+                // MAKER_FILLED — resting order filled by an aggressor
+                // leaves_qty == 0: fully filled → remove from live tracking
+                // leaves_qty > 0: partially filled → still resting, update nothing
+                if (ack->leaves_qty == 0) {
+                    erase_live(live_map, live_keys, eid);
+                }
             }
 
             rbuf.read_idx += hdr->msg_size;

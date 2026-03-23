@@ -64,7 +64,7 @@ class OrderBook {
     }
 
     // Returns the total quantity matched during this fill sweep.
-    auto match_buy(Order &taker) -> uint32_t {
+    auto match_buy(Order &taker, MakerFillBuffer *fills) -> uint32_t {
         uint32_t total_matched = 0;
         for (uint64_t price = lowest_ask_; price <= taker.price; price += tick_size_) {
             PriceLevel *level = asks_.get_level(price);
@@ -91,6 +91,14 @@ class OrderBook {
                 level->total_quantity -= trade_qty;
 
                 if (maker.quantity == 0) {
+                    if (fills != nullptr && fills->count < MAX_MAKER_FILLS) {
+                        auto &f = fills->fills[fills->count++];
+                        f.order_id = maker.order_id;
+                        f.cl_ord_id = maker.cl_ord_id;
+                        f.client_fd = maker.client_fd;
+                        f.matched_qty = trade_qty;
+                        f.leaves_qty = 0;
+                    }
                     uint32_t next_idx = maker.next_idx;
                     // Matching always consumes from the head — fast-path unlink.
                     level->head_idx = next_idx;
@@ -105,6 +113,14 @@ class OrderBook {
                     node_pool_.deallocate(&maker);
                     maker_idx = next_idx;
                 } else {
+                    if (fills != nullptr && fills->count < MAX_MAKER_FILLS) {
+                        auto &f = fills->fills[fills->count++];
+                        f.order_id = maker.order_id;
+                        f.cl_ord_id = maker.cl_ord_id;
+                        f.client_fd = maker.client_fd;
+                        f.matched_qty = trade_qty;
+                        f.leaves_qty = maker.quantity;
+                    }
                     break;
                 }
             }
@@ -121,7 +137,7 @@ class OrderBook {
     }
 
     // Returns the total quantity matched during this fill sweep.
-    auto match_sell(Order &taker) -> uint32_t {
+    auto match_sell(Order &taker, MakerFillBuffer *fills) -> uint32_t {
         uint32_t total_matched = 0;
         for (uint64_t price = highest_bid_; price >= taker.price; price -= tick_size_) {
             PriceLevel *level = bids_.get_level(price);
@@ -151,6 +167,14 @@ class OrderBook {
                 level->total_quantity -= trade_qty;
 
                 if (maker.quantity == 0) {
+                    if (fills != nullptr && fills->count < MAX_MAKER_FILLS) {
+                        auto &f = fills->fills[fills->count++];
+                        f.order_id = maker.order_id;
+                        f.cl_ord_id = maker.cl_ord_id;
+                        f.client_fd = maker.client_fd;
+                        f.matched_qty = trade_qty;
+                        f.leaves_qty = 0;
+                    }
                     uint32_t next_idx = maker.next_idx;
                     // Matching always consumes from the head — fast-path unlink.
                     level->head_idx = next_idx;
@@ -165,6 +189,14 @@ class OrderBook {
                     node_pool_.deallocate(&maker);
                     maker_idx = next_idx;
                 } else {
+                    if (fills != nullptr && fills->count < MAX_MAKER_FILLS) {
+                        auto &f = fills->fills[fills->count++];
+                        f.order_id = maker.order_id;
+                        f.cl_ord_id = maker.cl_ord_id;
+                        f.client_fd = maker.client_fd;
+                        f.matched_qty = trade_qty;
+                        f.leaves_qty = maker.quantity;
+                    }
                     break;
                 }
             }
@@ -181,7 +213,7 @@ class OrderBook {
     }
 
     // Returns ProcessResult describing how the new order was resolved.
-    auto on_new_order(Order &order) -> ProcessResult {
+    auto on_new_order(Order &order, MakerFillBuffer *fills) -> ProcessResult {
         uint32_t original_qty = order.quantity;
 
         // FOK: check available liquidity BEFORE touching the book.
@@ -214,9 +246,9 @@ class OrderBook {
 
         uint32_t matched = 0;
         if (order.side == Side::BUY) {
-            matched = match_buy(order);
+            matched = match_buy(order, fills);
         } else {
-            matched = match_sell(order);
+            matched = match_sell(order, fills);
         }
 
         // IOC/FOK: discard remainder (never rest)
@@ -240,6 +272,8 @@ class OrderBook {
         node->order_id = order.order_id;
         node->quantity = order.quantity;
         node->side = order.side;
+        node->cl_ord_id = order.cl_ord_id;
+        node->client_fd = order.client_fd;
 
         PriceLevel *level = nullptr;
         if (order.side == Side::BUY) {
@@ -305,21 +339,24 @@ class OrderBook {
     OrderBook &operator=(const OrderBook &) = delete;
 
     // Returns ProcessResult describing how the order was resolved.
-    auto process_order(const Order &incoming_order) -> ProcessResult {
+    auto process_order(const Order &incoming_order,
+                       MakerFillBuffer *fills = nullptr) -> ProcessResult {
+        if (fills)
+            fills->clear();
         Order order = incoming_order;
         switch (order.type) {
         case OrderType::NEW:
-            return on_new_order(order);
+            return on_new_order(order, fills);
         case OrderType::CANCEL:
             return on_cancel_order(order);
         case OrderType::MODIFY: {
             on_cancel_order(order); // ignore cancel result for modify
-            return on_new_order(order);
+            return on_new_order(order, fills);
         }
         case OrderType::IOC:
-            return on_new_order(order);
+            return on_new_order(order, fills);
         case OrderType::FOK:
-            return on_new_order(order);
+            return on_new_order(order, fills);
         default:
             return {0, 0, EventType::CANCELLED};
         }

@@ -59,19 +59,32 @@ class MetricsThread {
         while (is_running_.load(std::memory_order_acquire)) {
             OutboundEvent event;
             if (outbound_queue_.pop(consumer_id_, event)) {
-                ++order_count;
-                if (event.matched_qty > 0) {
-                    ++matched_orders;
-                    total_matched_qty += event.matched_qty;
-                }
-                // Record latency only when the sender provided a valid stamp.
-                if (event.entry_tsc > 0 && event.process_tsc > event.entry_tsc) {
-                    uint64_t lat = event.process_tsc - event.entry_tsc;
-                    total_latency_tsc += lat;
-                    if (lat > max_latency_tsc) {
-                        max_latency_tsc = lat;
+                // MAKER_FILLED events are fill notifications for resting orders — skip
+                // throughput count so we don't double-count matched pairs.
+                if (event.event_type == EventType::MAKER_FILLED) {
+                    if (event.entry_tsc > 0 && event.process_tsc > event.entry_tsc) {
+                        uint64_t lat = event.process_tsc - event.entry_tsc;
+                        total_latency_tsc += lat;
+                        if (lat > max_latency_tsc) {
+                            max_latency_tsc = lat;
+                        }
+                        lat_hist.record(lat);
                     }
-                    lat_hist.record(lat);
+                } else {
+                    ++order_count;
+                    if (event.matched_qty > 0) {
+                        ++matched_orders;
+                        total_matched_qty += event.matched_qty;
+                    }
+                    // Record latency only when the sender provided a valid stamp.
+                    if (event.entry_tsc > 0 && event.process_tsc > event.entry_tsc) {
+                        uint64_t lat = event.process_tsc - event.entry_tsc;
+                        total_latency_tsc += lat;
+                        if (lat > max_latency_tsc) {
+                            max_latency_tsc = lat;
+                        }
+                        lat_hist.record(lat);
+                    }
                 }
             } else {
                 // Yield so the gateway worker sharing this core gets CPU time.

@@ -1,6 +1,5 @@
 #pragma once
 #include "exchange/engine/types.hpp"
-#include "exchange/network/ack_routing_table.hpp"
 #include "exchange/network/protocol.hpp"
 #include "exchange/queue/spmc_broadcast_queue.hpp"
 #include <atomic>
@@ -30,7 +29,6 @@ class AckThread {
         sizeof(network::MsgHeader) + sizeof(network::AckMsg);
 
     queue::SpmcBroadcastQueue<OutboundEvent> &outbound_;
-    network::AckRoutingTable &routing_table_;
     std::atomic<bool> is_running_{false};
     std::thread thread_;
     int consumer_id_{-1};
@@ -73,14 +71,14 @@ class AckThread {
                 continue;
             }
 
-            const auto &entry = routing_table_.get(event.order_id);
-            if (entry.client_fd < 0) {
-                // No routing entry — order came from a client that disconnected.
+            // No routing info — this order came from a disconnected client or
+            // an internal cancel with no return path.
+            if (event.client_fd < 0) {
                 continue;
             }
 
             // Append ACK bytes to this client's send buffer.
-            auto &buf = send_bufs[entry.client_fd];
+            auto &buf = send_bufs[event.client_fd];
             const std::size_t old_size = buf.size();
             buf.resize(old_size + ACK_MSG_SIZE);
 
@@ -90,21 +88,13 @@ class AckThread {
 
             network::AckMsg ack{};
             ack.exchange_order_id = event.order_id;
-            ack.cl_ord_id = entry.cl_ord_id;
+            ack.cl_ord_id = event.cl_ord_id;
             ack.matched_qty = event.matched_qty;
             ack.leaves_qty = event.leaves_qty;
             ack.event_type = static_cast<uint8_t>(event.event_type);
 
             __builtin_memcpy(buf.data() + old_size, &hdr, sizeof(hdr));
             __builtin_memcpy(buf.data() + old_size + sizeof(hdr), &ack, sizeof(ack));
-
-            // Free routing slot for fully-resolved orders.
-            bool resolved = (event.event_type == EventType::FILLED ||
-                             event.event_type == EventType::CANCELLED ||
-                             event.event_type == EventType::CANCEL_REJECTED);
-            if (resolved) {
-                routing_table_.clear(event.order_id);
-            }
 
             if (++events_since_flush >= ACK_BATCH) {
                 flush_all();
@@ -113,9 +103,7 @@ class AckThread {
     }
 
   public:
-    explicit AckThread(queue::SpmcBroadcastQueue<OutboundEvent> &outbound,
-                       network::AckRoutingTable &routing_table)
-        : outbound_(outbound), routing_table_(routing_table) {
+    explicit AckThread(queue::SpmcBroadcastQueue<OutboundEvent> &outbound) : outbound_(outbound) {
         consumer_id_ = outbound_.register_best_effort_consumer();
     }
 
