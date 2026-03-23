@@ -36,8 +36,9 @@ constexpr uint64_t MID_PRICE_MIN = 500;   // Minimum mid price (clamp)
 constexpr uint64_t MID_PRICE_MAX = 1500;  // Maximum mid price (clamp)
 constexpr uint64_t AGGRESSIVE_OFFSET = 2; // Buys at mid+offset, sells at mid-offset
 
-// Default rate limit: 0 means unlimited (as fast as possible)
-constexpr uint64_t DEFAULT_RATE_LIMIT = 0;
+// Default rate limit per client. 1700000 = sweet spot (6.8M/s total at sub-ms latency).
+// 0 = unlimited (max throughput, high latency).
+constexpr uint64_t DEFAULT_RATE_LIMIT = 1700000;
 } // namespace load_gen
 
 } // namespace exchange::config
