@@ -20,13 +20,15 @@ namespace exchange::engine {
 // queue capacity behind, it skips ahead (events are dropped) so MetricsThread
 // and the engine are never impaired.
 //
-// Also drains an optional maker_fill_queue_ (MpscQueue) that carries
-// MAKER_FILLED events on a path that bypasses MetricsThread entirely.
+// Also drains an optional maker_fill_queue_ that carries MAKER_FILLED events
+// on a path that bypasses MetricsThread entirely.
 //
 // Batching: ACKs are accumulated per client_fd and flushed in one send()
-// call per client every ACK_BATCH events (or on idle). This reduces syscalls
-// from O(events) to O(events/ACK_BATCH * num_clients) — ~64× fewer at
-// ACK_BATCH=256, keeping the thread from falling behind the engine.
+// call per client every ACK_BATCH events (or on idle). Each queue has its own
+// independent flush counter — taker ACKs flush every ACK_BATCH taker events,
+// maker fill ACKs flush every ACK_BATCH maker fill events. This prevents
+// maker fill volume from inflating the effective flush interval for taker ACKs
+// (which would inflate round-trip latency at rate-limited operation).
 class AckThread {
   private:
     static constexpr int ACK_BATCH = 256; // flush per-client buffer every N events
@@ -78,7 +80,10 @@ class AckThread {
         std::unordered_map<int, std::vector<char>> send_bufs;
         send_bufs.reserve(8);
 
-        int events_since_flush = 0;
+        // Independent flush counters per queue — prevents maker fill volume from
+        // inflating the effective flush interval for taker ACKs.
+        int taker_events_since_flush = 0;
+        int maker_events_since_flush = 0;
 
         auto flush_all = [&]() {
             for (auto &[fd, buf] : send_bufs) {
@@ -87,7 +92,8 @@ class AckThread {
                     buf.clear();
                 }
             }
-            events_since_flush = 0;
+            taker_events_since_flush = 0;
+            maker_events_since_flush = 0;
         };
 
         while (is_running_.load(std::memory_order_acquire)) {
@@ -99,7 +105,7 @@ class AckThread {
                 got_any = true;
                 // Skip poison pill (order_id == 0 used for engine shutdown)
                 if (event.order_id != 0 && event.client_fd >= 0) {
-                    append_ack(send_bufs, event, events_since_flush, flush_all);
+                    append_ack(send_bufs, event, taker_events_since_flush, flush_all);
                 }
             }
 
@@ -109,13 +115,13 @@ class AckThread {
                 while (maker_fill_queue_->pop_best_effort(maker_fill_consumer_id_, mfev)) {
                     got_any = true;
                     if (mfev.order_id != 0 && mfev.client_fd >= 0) {
-                        append_ack(send_bufs, mfev, events_since_flush, flush_all);
+                        append_ack(send_bufs, mfev, maker_events_since_flush, flush_all);
                     }
                 }
             }
 
             if (!got_any) {
-                if (events_since_flush > 0) {
+                if (taker_events_since_flush > 0 || maker_events_since_flush > 0) {
                     flush_all();
                 }
                 std::this_thread::yield();
