@@ -63,13 +63,16 @@ class MatchingEngine {
                 uint64_t process_tsc = rdtsc();
                 OrderBook *book =
                     (router_ != nullptr) ? router_->get_book(buf[i].symbol_id) : &order_book_;
-                uint32_t matched_qty = (book != nullptr) ? book->process_order(buf[i]) : 0;
+                ProcessResult result =
+                    (book != nullptr) ? book->process_order(buf[i]) : ProcessResult{};
                 if (outbound_ != nullptr) {
                     OutboundEvent event;
                     event.order_id = buf[i].order_id;
                     event.entry_tsc = buf[i].timestamp_tsc;
                     event.process_tsc = process_tsc;
-                    event.matched_qty = matched_qty;
+                    event.matched_qty = result.matched_qty;
+                    event.leaves_qty = result.leaves_qty;
+                    event.event_type = result.event_type;
                     // Drop on full — metrics miss a tick, engine never stalls.
                     if (!outbound_->push(event)) {
                         outbound_drops_.fetch_add(1, std::memory_order_relaxed);

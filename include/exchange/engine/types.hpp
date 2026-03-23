@@ -9,6 +9,14 @@ enum class Side : uint8_t { BUY, SELL };
 
 enum class OrderType : uint8_t { NEW, CANCEL, MODIFY, IOC, FOK };
 
+enum class EventType : uint8_t {
+    NEW_ACK = 0,          // Order accepted and resting in book
+    PARTIALLY_FILLED = 1, // Partially filled, remainder still resting
+    FILLED = 2,           // Fully filled
+    CANCELLED = 3,        // Cancel succeeded, or IOC/FOK with no fill
+    CANCEL_REJECTED = 4,  // Cancel failed — order not found
+};
+
 struct alignas(HALF_CACHE_LINE_SIZE) Order {
     uint64_t order_id;
     uint64_t price;
@@ -26,18 +34,27 @@ struct Trade {
     uint32_t quantity;
 };
 
-// ---------------------------------------------------------------------------
-// Outbound events published by the engine to downstream consumers
-// (e.g., MetricsThread). Single-producer, broadcast semantics.
-// Flat layout: 32 bytes, no padding, fits one per half-cache-line.
-// ---------------------------------------------------------------------------
+// Result returned by OrderBook::process_order().
+struct ProcessResult {
+    uint32_t matched_qty{0}; // qty filled by this order
+    uint32_t leaves_qty{0};  // qty remaining in book (0 = fully resolved)
+    EventType event_type{EventType::NEW_ACK};
+};
 
+// ---------------------------------------------------------------------------
+// Outbound events published by the engine to downstream consumers.
+// Single-producer, broadcast semantics.
+// 40 bytes: order_id(8) + entry_tsc(8) + process_tsc(8) + matched_qty(4) +
+//           leaves_qty(4) + event_type(1) + _pad(7)
+// ---------------------------------------------------------------------------
 struct OutboundEvent {
     uint64_t order_id;
-    uint64_t entry_tsc;   // timestamp_tsc from the incoming Order
-    uint64_t process_tsc; // rdtsc() captured at the start of processing
-    uint32_t matched_qty; // total quantity matched (0 if resting order)
-    uint32_t _pad{0};
+    uint64_t entry_tsc;
+    uint64_t process_tsc;
+    uint32_t matched_qty;
+    uint32_t leaves_qty;
+    EventType event_type{EventType::NEW_ACK};
+    uint8_t _pad[7]{};
 };
 
 } // namespace exchange::engine

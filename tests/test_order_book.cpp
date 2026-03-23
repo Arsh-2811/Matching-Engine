@@ -208,7 +208,7 @@ TEST_F(OrderBookTest, IOCOrderFillsAndDiscardsRemainder) {
     // Resting sell for 50
     book.process_order({1, 150, 50, Side::SELL, OrderType::NEW});
     // IOC buy for 100 — only 50 available at or below 150
-    uint32_t matched = book.process_order({2, 150, 100, Side::BUY, OrderType::IOC});
+    uint32_t matched = book.process_order({2, 150, 100, Side::BUY, OrderType::IOC}).matched_qty;
     EXPECT_EQ(matched, 50); // filled 50
     // No resting buy should exist
     PriceLevel *bid = book.get_bids().get_level(150);
@@ -217,7 +217,7 @@ TEST_F(OrderBookTest, IOCOrderFillsAndDiscardsRemainder) {
 
 TEST_F(OrderBookTest, IOCOrderNoLiquidityIsFullyCancelled) {
     // IOC with no resting orders — should cancel fully
-    uint32_t matched = book.process_order({1, 150, 100, Side::BUY, OrderType::IOC});
+    uint32_t matched = book.process_order({1, 150, 100, Side::BUY, OrderType::IOC}).matched_qty;
     EXPECT_EQ(matched, 0);
     PriceLevel *bid = book.get_bids().get_level(150);
     EXPECT_TRUE(bid == nullptr || bid->total_quantity == 0);
@@ -227,7 +227,7 @@ TEST_F(OrderBookTest, FOKOrderFullLiquidityFills) {
     // Resting sell for 100
     book.process_order({1, 150, 100, Side::SELL, OrderType::NEW});
     // FOK buy for 100 — enough liquidity
-    uint32_t matched = book.process_order({2, 150, 100, Side::BUY, OrderType::FOK});
+    uint32_t matched = book.process_order({2, 150, 100, Side::BUY, OrderType::FOK}).matched_qty;
     EXPECT_EQ(matched, 100);
 }
 
@@ -235,7 +235,7 @@ TEST_F(OrderBookTest, FOKOrderInsufficientLiquidityIsCancelled) {
     // Resting sell for 50 only
     book.process_order({1, 150, 50, Side::SELL, OrderType::NEW});
     // FOK buy for 100 — insufficient, cancel entire order
-    uint32_t matched = book.process_order({2, 150, 100, Side::BUY, OrderType::FOK});
+    uint32_t matched = book.process_order({2, 150, 100, Side::BUY, OrderType::FOK}).matched_qty;
     EXPECT_EQ(matched, 0);
     // Resting sell should be UNCHANGED (FOK checked before touching book)
     PriceLevel *ask = book.get_asks().get_level(150);

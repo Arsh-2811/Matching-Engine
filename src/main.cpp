@@ -1,9 +1,11 @@
 #include "exchange/common/config.hpp"
+#include "exchange/engine/ack_thread.hpp"
 #include "exchange/engine/market_data_thread.hpp"
 #include "exchange/engine/matching_engine.hpp"
 #include "exchange/engine/metrics_thread.hpp"
 #include "exchange/engine/order_book.hpp"
 #include "exchange/engine/types.hpp"
+#include "exchange/network/ack_routing_table.hpp"
 #include "exchange/network/gateway.hpp"
 #include "exchange/queue/mpsc_queue.hpp"
 #include "exchange/queue/spmc_broadcast_queue.hpp"
@@ -22,31 +24,29 @@ auto main() -> int {
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
 
-    // ----- Inbound path -----
     queue::MpscQueue<engine::Order> incoming_queue(cfg::engine::QUEUE_CAPACITY);
 
-    // ----- Outbound path (broadcast to all downstream consumers) -----
     queue::SpmcBroadcastQueue<engine::OutboundEvent> outbound_queue(
         cfg::engine::OUTBOUND_QUEUE_CAPACITY);
 
-    // MetricsThread must be constructed first — it registers as a consumer
-    // before the engine starts pushing events.
+    // Register all consumers before the engine starts pushing events.
     engine::MetricsThread metrics(outbound_queue, &incoming_queue);
-
-    // MarketDataThread registers as a second consumer before engine starts.
     engine::MarketDataThread market_data(outbound_queue);
+
+    network::AckRoutingTable routing_table(cfg::engine::MAX_ORDERS);
+    engine::AckThread ack_thread(outbound_queue, routing_table);
 
     engine::OrderBook book(cfg::engine::MAX_ORDERS, cfg::engine::MIN_PRICE, cfg::engine::MAX_PRICE,
                            cfg::engine::TICK_SIZE);
 
     engine::MatchingEngine engine(incoming_queue, book, &outbound_queue);
 
-    network::Gateway gateway(incoming_queue, cfg::network::PORT, 2);
+    network::Gateway gateway(incoming_queue, routing_table, cfg::network::PORT, 2);
 
-    // Start threads — engine first so it is ready before clients arrive.
     engine.start(cfg::engine::ENGINE_CORE_ID);
     metrics.start(cfg::engine::METRICS_CORE_ID);
     market_data.start(cfg::engine::METRICS_CORE_ID);
+    ack_thread.start(0); // Core 0 — main thread's core, otherwise idle
     gateway.start({cfg::engine::GATEWAY_CORE_1, cfg::engine::GATEWAY_CORE_2});
 
     std::printf("Exchange is LIVE on port %d...\n", cfg::network::PORT);
@@ -60,7 +60,6 @@ auto main() -> int {
     std::printf("Shutting down exchange...\n");
     std::fflush(stdout);
 
-    // Graceful shutdown: stop gateway first, then send poison pill to engine.
     gateway.stop();
 
     engine::Order poison{};
@@ -74,6 +73,7 @@ auto main() -> int {
 
     metrics.stop();
     market_data.stop();
+    ack_thread.stop();
 
     std::printf("Exchange shut down cleanly.\n");
     std::fflush(stdout);

@@ -7,6 +7,7 @@
 #include <csignal>
 #include <cstdio>
 #include <cstring>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
@@ -29,6 +30,11 @@ static constexpr uint32_t ORDER_DEFAULT_QTY = 10;
 static constexpr double UNLIMITED_TOKENS_PER_CYCLE = 1.0e18;
 static constexpr double NS_PER_SEC_DOUBLE = 1.0e9;
 static constexpr int TOKEN_BUCKET_BURST_MULTIPLIER = 4;
+static constexpr int CANCEL_INTERVAL = 10; // 10% cancel rate by new-order count
+
+// Wire size of an ACK message from the server.
+static constexpr std::size_t ACK_MSG_SIZE = sizeof(MsgHeader) + sizeof(AckMsg);
+static constexpr std::size_t RECV_BUF_CAPACITY = 4096;
 
 // Simple token-bucket rate limiter.
 // tokens_per_cycle = target_orders_per_sec / tsc_frequency_hz
@@ -94,6 +100,110 @@ auto tl_rand() -> uint64_t {
 }
 } // namespace
 
+// Per-client recv buffer for parsing AckMsg responses.
+struct RecvBuffer {
+    char data[RECV_BUF_CAPACITY]{};
+    size_t read_idx{0};
+    size_t write_idx{0};
+
+    [[nodiscard]] auto pending_bytes() const -> size_t { return write_idx - read_idx; }
+    [[nodiscard]] auto available_space() const -> size_t { return RECV_BUF_CAPACITY - write_idx; }
+
+    void compact() {
+        if (read_idx > 0 && write_idx > read_idx) {
+            std::memmove(data, data + read_idx, write_idx - read_idx);
+            write_idx -= read_idx;
+            read_idx = 0;
+        } else if (read_idx == write_idx) {
+            read_idx = 0;
+            write_idx = 0;
+        }
+    }
+};
+
+// Live order entry: exchange order ID + original cl_ord_id.
+struct LiveOrder {
+    uint64_t exchange_order_id;
+    uint64_t cl_ord_id;
+};
+
+// Drain any available ACK messages from the socket.
+// Updates live_orders, cancels_acked, cancel_rejects in-place.
+static void drain_acks(int sock, RecvBuffer &rbuf, std::vector<LiveOrder> &live_orders,
+                       uint64_t &cancels_acked, uint64_t &cancel_rejects) {
+    // Compact if needed
+    if (rbuf.available_space() < ACK_MSG_SIZE) {
+        rbuf.compact();
+    }
+
+    ssize_t n = recv(sock, rbuf.data + rbuf.write_idx, rbuf.available_space(), MSG_DONTWAIT);
+    if (n > 0) {
+        rbuf.write_idx += static_cast<size_t>(n);
+    }
+
+    // Parse complete ACK messages
+    while (rbuf.pending_bytes() >= ACK_MSG_SIZE) {
+        auto *hdr = reinterpret_cast<MsgHeader *>(rbuf.data + rbuf.read_idx);
+        if (hdr->type != MsgType::ORDER_ACK) {
+            // Unknown message type — skip by msg_size if valid, else by 1 byte
+            if (hdr->msg_size >= sizeof(MsgHeader) && rbuf.pending_bytes() >= hdr->msg_size) {
+                rbuf.read_idx += hdr->msg_size;
+            } else {
+                rbuf.read_idx += 1;
+            }
+            continue;
+        }
+        if (rbuf.pending_bytes() < hdr->msg_size) {
+            break;
+        }
+
+        auto *ack = reinterpret_cast<AckMsg *>(rbuf.data + rbuf.read_idx + sizeof(MsgHeader));
+        uint8_t et = ack->event_type;
+        uint64_t eid = ack->exchange_order_id;
+
+        // EventType values (must match engine::EventType enum):
+        // 0=NEW_ACK, 1=PARTIALLY_FILLED, 2=FILLED, 3=CANCELLED, 4=CANCEL_REJECTED
+        if (et == 0 || et == 1) {
+            // NEW_ACK or PARTIALLY_FILLED: track as live if not already present
+            bool found = false;
+            for (const auto &lo : live_orders) {
+                if (lo.exchange_order_id == eid) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                live_orders.push_back({eid, ack->cl_ord_id});
+            }
+        } else if (et == 2 || et == 3) {
+            // FILLED or CANCELLED: remove from live_orders
+            for (auto it = live_orders.begin(); it != live_orders.end(); ++it) {
+                if (it->exchange_order_id == eid) {
+                    live_orders.erase(it);
+                    break;
+                }
+            }
+            if (et == 3) {
+                ++cancels_acked;
+            }
+        } else if (et == 4) {
+            // CANCEL_REJECTED
+            ++cancel_rejects;
+            // Remove from live_orders if present (defensive)
+            for (auto it = live_orders.begin(); it != live_orders.end(); ++it) {
+                if (it->exchange_order_id == eid) {
+                    live_orders.erase(it);
+                    break;
+                }
+            }
+        }
+
+        rbuf.read_idx += hdr->msg_size;
+    }
+
+    rbuf.compact();
+}
+
 static void run_client(int client_id, uint64_t target_rate_per_sec, double ns_per_cycle, int port) {
     tl_rng_seed();
     int sock = socket(AF_INET, SOCK_STREAM, 0);
@@ -135,6 +245,15 @@ static void run_client(int client_id, uint64_t target_rate_per_sec, double ns_pe
     // NOLINTNEXTLINE(modernize-avoid-c-arrays)
     char batch_buf[BATCH_BYTES];
 
+    RecvBuffer rbuf;
+    std::vector<LiveOrder> live_orders;
+    live_orders.reserve(256);
+
+    uint64_t cancels_sent = 0;
+    uint64_t cancels_acked = 0;
+    uint64_t cancel_rejects = 0;
+    int cancel_counter = 0;
+
     while (keep_running.load(std::memory_order_relaxed)) {
         if (!bucket.try_consume()) {
             CPU_PAUSE();
@@ -147,6 +266,28 @@ static void run_client(int client_id, uint64_t target_rate_per_sec, double ns_pe
             ++mid_price;
         } else if (delta < 0 && mid_price > load_gen::MID_PRICE_MIN) {
             --mid_price;
+        }
+
+        // Maybe send a cancel before the new-order batch
+        if (cancel_counter >= CANCEL_INTERVAL && !live_orders.empty()) {
+            size_t pick = static_cast<size_t>(tl_rand() % live_orders.size());
+            LiveOrder &lo = live_orders[pick];
+
+            MsgHeader chdr{static_cast<uint16_t>(SINGLE_MSG_SIZE), MsgType::CANCEL_ORDER};
+            SbeOrder corder{.order_id = lo.exchange_order_id,
+                            .price = 0,
+                            .quantity = 0,
+                            .side = 0,
+                            .type = 1, // CANCEL
+                            .timestamp_tsc = rdtsc()};
+
+            char cancel_buf[SINGLE_MSG_SIZE];
+            std::memcpy(cancel_buf, &chdr, sizeof(chdr));
+            std::memcpy(cancel_buf + sizeof(chdr), &corder, sizeof(corder));
+            send(sock, cancel_buf, SINGLE_MSG_SIZE, 0);
+
+            ++cancels_sent;
+            cancel_counter = 0;
         }
 
         for (int idx = 0; idx < load_gen::BATCH_SIZE; ++idx) {
@@ -179,7 +320,17 @@ static void run_client(int client_id, uint64_t target_rate_per_sec, double ns_pe
         if (send(sock, batch_buf, BATCH_BYTES, 0) < 0) {
             break;
         }
+
+        ++cancel_counter;
+
+        // Drain ACKs non-blocking — don't stall the send loop.
+        drain_acks(sock, rbuf, live_orders, cancels_acked, cancel_rejects);
     }
+
+    std::fprintf(stderr, "Client %d: cancels_sent=%llu cancels_acked=%llu cancel_rejects=%llu\n",
+                 client_id, static_cast<unsigned long long>(cancels_sent),
+                 static_cast<unsigned long long>(cancels_acked),
+                 static_cast<unsigned long long>(cancel_rejects));
 
     close(sock);
 }

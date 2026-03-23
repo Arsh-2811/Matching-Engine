@@ -21,6 +21,7 @@ constexpr int ENGINE_CORE_ID = 1;
 constexpr int GATEWAY_CORE_1 = 2;
 constexpr int GATEWAY_CORE_2 = 3;
 constexpr int METRICS_CORE_ID = 3; // Shares core 3 with GATEWAY_CORE_2
+constexpr int ACK_CORE_ID = 0;     // AckThread — main thread's core, otherwise idle
 
 constexpr uint64_t TSC_CALIBRATION_MS = 50; // Duration for TSC frequency calibration
 } // namespace engine
