@@ -30,10 +30,12 @@ auto main() -> int {
         cfg::engine::OUTBOUND_QUEUE_CAPACITY);
 
     // Register all consumers before the engine starts pushing events.
+    // Critical consumers first (affect backpressure), then best-effort.
     engine::MetricsThread metrics(outbound_queue, &incoming_queue);
     engine::MarketDataThread market_data(outbound_queue);
 
     network::AckRoutingTable routing_table(cfg::engine::MAX_ORDERS);
+    // AckThread registers as best-effort consumer — never blocks the producer.
     engine::AckThread ack_thread(outbound_queue, routing_table);
 
     engine::OrderBook book(cfg::engine::MAX_ORDERS, cfg::engine::MIN_PRICE, cfg::engine::MAX_PRICE,
