@@ -194,9 +194,9 @@ def run_stress_test(duration: int, num_clients: int, rate: int,
     # ---------- launch load_gen ----------
     rate_str = "unlimited" if rate == 0 else f"{rate:,} orders/s/client"
     print(f"[run] Starting load_gen: {num_clients} clients @ {rate_str}")
-    lg_args = [str(loadgen_bin), str(num_clients)]
-    if rate > 0:
-        lg_args.append(str(rate))
+    # Always pass rate explicitly — 0 means unlimited in load_gen argv[2].
+    # Omitting argv[2] uses DEFAULT_RATE_LIMIT from config.hpp (not necessarily 0).
+    lg_args = [str(loadgen_bin), str(num_clients), str(rate)]
     loadgen_proc = subprocess.Popen(
         lg_args,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
