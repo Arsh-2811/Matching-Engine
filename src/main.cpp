@@ -29,6 +29,11 @@ auto main() -> int {
     queue::SpmcBroadcastQueue<engine::OutboundEvent> outbound_queue(
         cfg::engine::OUTBOUND_QUEUE_CAPACITY);
 
+    // Dedicated SPMC queue (zero critical consumers) for MAKER_FILLED events.
+    // No critical consumers → push() never reads consumer cursors (zero cross-core loads).
+    static constexpr std::size_t MAKER_FILL_QUEUE_CAPACITY = 1 << 16; // 64K slots
+    queue::SpmcBroadcastQueue<engine::OutboundEvent> maker_fill_queue(MAKER_FILL_QUEUE_CAPACITY);
+
     // Register all consumers before the engine starts pushing events.
     // Critical consumers first (affect backpressure), then best-effort.
     engine::MetricsThread metrics(outbound_queue, &incoming_queue);
@@ -36,12 +41,12 @@ auto main() -> int {
 
     network::AckRoutingTable routing_table(cfg::engine::MAX_ORDERS);
     // AckThread registers as best-effort consumer — never blocks the producer.
-    engine::AckThread ack_thread(outbound_queue);
+    engine::AckThread ack_thread(outbound_queue, &maker_fill_queue);
 
     engine::OrderBook book(cfg::engine::MAX_ORDERS, cfg::engine::MIN_PRICE, cfg::engine::MAX_PRICE,
                            cfg::engine::TICK_SIZE);
 
-    engine::MatchingEngine engine(incoming_queue, book, &outbound_queue);
+    engine::MatchingEngine engine(incoming_queue, book, &outbound_queue, &maker_fill_queue);
 
     network::Gateway gateway(incoming_queue, routing_table, cfg::network::PORT, 2);
 

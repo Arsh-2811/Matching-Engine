@@ -8,12 +8,21 @@
 #include <cstddef>
 #include <cstdint>
 #include <sys/types.h>
+#include <vector>
 
 namespace exchange::engine {
 class OrderBook {
   private:
     MemoryPool<OrderNode> node_pool_;
     OrderLookup order_lookup_;
+
+    // Cold routing data parallel to node_pool_ — indexed by pool slot index.
+    // Kept separate so the 32-byte hot OrderNode stays 2-per-cache-line.
+    struct NodeRouting {
+        uint64_t cl_ord_id{0};
+        int client_fd{-1};
+    };
+    std::vector<NodeRouting> node_routing_;
 
     PriceLevelIndex bids_;
     PriceLevelIndex asks_;
@@ -92,12 +101,13 @@ class OrderBook {
 
                 if (maker.quantity == 0) {
                     if (fills != nullptr && fills->count < MAX_MAKER_FILLS) {
-                        auto &f = fills->fills[fills->count++];
-                        f.order_id = maker.order_id;
-                        f.cl_ord_id = maker.cl_ord_id;
-                        f.client_fd = maker.client_fd;
-                        f.matched_qty = trade_qty;
-                        f.leaves_qty = 0;
+                        const auto &routing = node_routing_[maker_idx];
+                        auto &fill = fills->fills[fills->count++];
+                        fill.order_id = maker.order_id;
+                        fill.cl_ord_id = routing.cl_ord_id;
+                        fill.client_fd = routing.client_fd;
+                        fill.matched_qty = trade_qty;
+                        fill.leaves_qty = 0;
                     }
                     uint32_t next_idx = maker.next_idx;
                     // Matching always consumes from the head — fast-path unlink.
@@ -114,12 +124,13 @@ class OrderBook {
                     maker_idx = next_idx;
                 } else {
                     if (fills != nullptr && fills->count < MAX_MAKER_FILLS) {
-                        auto &f = fills->fills[fills->count++];
-                        f.order_id = maker.order_id;
-                        f.cl_ord_id = maker.cl_ord_id;
-                        f.client_fd = maker.client_fd;
-                        f.matched_qty = trade_qty;
-                        f.leaves_qty = maker.quantity;
+                        const auto &routing = node_routing_[maker_idx];
+                        auto &fill = fills->fills[fills->count++];
+                        fill.order_id = maker.order_id;
+                        fill.cl_ord_id = routing.cl_ord_id;
+                        fill.client_fd = routing.client_fd;
+                        fill.matched_qty = trade_qty;
+                        fill.leaves_qty = maker.quantity;
                     }
                     break;
                 }
@@ -168,12 +179,13 @@ class OrderBook {
 
                 if (maker.quantity == 0) {
                     if (fills != nullptr && fills->count < MAX_MAKER_FILLS) {
-                        auto &f = fills->fills[fills->count++];
-                        f.order_id = maker.order_id;
-                        f.cl_ord_id = maker.cl_ord_id;
-                        f.client_fd = maker.client_fd;
-                        f.matched_qty = trade_qty;
-                        f.leaves_qty = 0;
+                        const auto &routing = node_routing_[maker_idx];
+                        auto &fill = fills->fills[fills->count++];
+                        fill.order_id = maker.order_id;
+                        fill.cl_ord_id = routing.cl_ord_id;
+                        fill.client_fd = routing.client_fd;
+                        fill.matched_qty = trade_qty;
+                        fill.leaves_qty = 0;
                     }
                     uint32_t next_idx = maker.next_idx;
                     // Matching always consumes from the head — fast-path unlink.
@@ -190,12 +202,13 @@ class OrderBook {
                     maker_idx = next_idx;
                 } else {
                     if (fills != nullptr && fills->count < MAX_MAKER_FILLS) {
-                        auto &f = fills->fills[fills->count++];
-                        f.order_id = maker.order_id;
-                        f.cl_ord_id = maker.cl_ord_id;
-                        f.client_fd = maker.client_fd;
-                        f.matched_qty = trade_qty;
-                        f.leaves_qty = maker.quantity;
+                        const auto &routing = node_routing_[maker_idx];
+                        auto &fill = fills->fills[fills->count++];
+                        fill.order_id = maker.order_id;
+                        fill.cl_ord_id = routing.cl_ord_id;
+                        fill.client_fd = routing.client_fd;
+                        fill.matched_qty = trade_qty;
+                        fill.leaves_qty = maker.quantity;
                     }
                     break;
                 }
@@ -272,8 +285,8 @@ class OrderBook {
         node->order_id = order.order_id;
         node->quantity = order.quantity;
         node->side = order.side;
-        node->cl_ord_id = order.cl_ord_id;
-        node->client_fd = order.client_fd;
+        const uint32_t node_idx = node_pool_.index_of(node);
+        node_routing_[node_idx] = {order.cl_ord_id, order.client_fd};
 
         PriceLevel *level = nullptr;
         if (order.side == Side::BUY) {
@@ -331,9 +344,10 @@ class OrderBook {
 
   public:
     OrderBook(std::size_t max_orders, uint64_t min_price, uint64_t max_price, uint64_t tick_size)
-        : node_pool_(max_orders), order_lookup_(max_orders), bids_(min_price, max_price, tick_size),
-          asks_(min_price, max_price, tick_size), min_price_(min_price), max_price_(max_price),
-          tick_size_(tick_size), highest_bid_(min_price), lowest_ask_(max_price) {}
+        : node_pool_(max_orders), order_lookup_(max_orders), node_routing_(max_orders),
+          bids_(min_price, max_price, tick_size), asks_(min_price, max_price, tick_size),
+          min_price_(min_price), max_price_(max_price), tick_size_(tick_size),
+          highest_bid_(min_price), lowest_ask_(max_price) {}
 
     OrderBook(const OrderBook &) = delete;
     OrderBook &operator=(const OrderBook &) = delete;

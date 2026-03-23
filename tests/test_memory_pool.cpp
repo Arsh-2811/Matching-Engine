@@ -85,9 +85,9 @@ TEST(MemoryPoolTest, GetByIndexRoundTrips) {
     EXPECT_EQ(&pool.get(idx1), node1);
 }
 
-TEST(MemoryPoolTest, NodeSizeIs48Bytes) {
-    // OrderNode is 48 bytes: 32 bytes of hot matching fields (order_id, quantity,
-    // side, price_level*, prev_idx, next_idx) followed by 16 bytes of cold routing
-    // fields (cl_ord_id, client_fd, _pad) embedded for maker-fill ACKs.
-    EXPECT_EQ(sizeof(OrderNode), 48U);
+TEST(MemoryPoolTest, NodeSizeIs32Bytes) {
+    // OrderNode is 32 bytes: hot matching fields only (order_id, quantity,
+    // side, price_level*, prev_idx, next_idx). Cold routing data (cl_ord_id,
+    // client_fd) lives in a parallel sidecar array in OrderBook.
+    EXPECT_EQ(sizeof(OrderNode), 32U);
 }
