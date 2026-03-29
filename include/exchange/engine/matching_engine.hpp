@@ -28,9 +28,14 @@ class MatchingEngine {
 
     queue::MpscQueue<Order> &incoming_queue_;
     OrderBook &order_book_;
-    // Optional outbound queue for ORDER_PROCESSED events. nullptr in unit-test
+    // Optional outbound queue for taker ORDER_PROCESSED events. nullptr in unit-test
     // contexts — no events are emitted and all stat tracking is skipped.
     queue::SpmcBroadcastQueue<OutboundEvent> *outbound_;
+    // Optional dedicated SPMC queue (zero critical consumers) for MAKER_FILLED events.
+    // No critical consumers → push() never reads consumer cursors (zero cross-core loads).
+    // Bypasses MetricsThread SPMC so the critical consumer's event rate stays at the
+    // taker-only baseline. AckThread consumes via pop_best_effort().
+    queue::SpmcBroadcastQueue<OutboundEvent> *maker_fill_queue_;
     // Optional symbol router for multi-instrument support. nullptr = single book.
     SymbolRouter *router_;
 
@@ -63,17 +68,49 @@ class MatchingEngine {
                 uint64_t process_tsc = rdtsc();
                 OrderBook *book =
                     (router_ != nullptr) ? router_->get_book(buf[i].symbol_id) : &order_book_;
-                uint32_t matched_qty = (book != nullptr) ? book->process_order(buf[i]) : 0;
                 if (outbound_ != nullptr) {
+                    MakerFillBuffer maker_buf;
+                    ProcessResult result = (book != nullptr)
+                                               ? book->process_order(buf[i], &maker_buf)
+                                               : ProcessResult{};
                     OutboundEvent event;
                     event.order_id = buf[i].order_id;
                     event.entry_tsc = buf[i].timestamp_tsc;
                     event.process_tsc = process_tsc;
-                    event.matched_qty = matched_qty;
+                    event.matched_qty = result.matched_qty;
+                    event.leaves_qty = result.leaves_qty;
+                    event.event_type = result.event_type;
+                    event.client_fd = buf[i].client_fd;
+                    event.cl_ord_id = buf[i].cl_ord_id;
                     // Drop on full — metrics miss a tick, engine never stalls.
                     if (!outbound_->push(event)) {
                         outbound_drops_.fetch_add(1, std::memory_order_relaxed);
                     }
+                    // Push MAKER_FILLED events to the dedicated maker-fill queue.
+                    // This bypasses the MetricsThread SPMC queue so the critical
+                    // consumer's event rate stays at the taker-only baseline.
+                    if (maker_fill_queue_ != nullptr) {
+                        for (uint8_t m = 0; m < maker_buf.count; ++m) {
+                            const auto &mf = maker_buf.fills[m];
+                            OutboundEvent mevent;
+                            mevent.order_id = mf.order_id;
+                            mevent.entry_tsc = 0;
+                            mevent.process_tsc = process_tsc;
+                            mevent.matched_qty = mf.matched_qty;
+                            mevent.leaves_qty = mf.leaves_qty;
+                            mevent.event_type = EventType::MAKER_FILLED;
+                            mevent.client_fd = mf.client_fd;
+                            mevent.cl_ord_id = mf.cl_ord_id;
+                            if (!maker_fill_queue_->push(mevent)) {
+                                outbound_drops_.fetch_add(1, std::memory_order_relaxed);
+                            }
+                        }
+                    }
+                } else {
+                    // Unit-test path: no outbound queue, still call process_order.
+                    ProcessResult result =
+                        (book != nullptr) ? book->process_order(buf[i]) : ProcessResult{};
+                    (void)result;
                 }
             }
         }
@@ -83,8 +120,10 @@ class MatchingEngine {
   public:
     explicit MatchingEngine(queue::MpscQueue<Order> &queue, OrderBook &book,
                             queue::SpmcBroadcastQueue<OutboundEvent> *outbound = nullptr,
+                            queue::SpmcBroadcastQueue<OutboundEvent> *maker_fill_queue = nullptr,
                             SymbolRouter *router = nullptr)
-        : incoming_queue_(queue), order_book_(book), outbound_(outbound), router_(router) {}
+        : incoming_queue_(queue), order_book_(book), outbound_(outbound),
+          maker_fill_queue_(maker_fill_queue), router_(router) {}
 
     MatchingEngine(const MatchingEngine &) = delete;
     MatchingEngine &operator=(const MatchingEngine &) = delete;

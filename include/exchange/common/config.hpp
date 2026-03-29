@@ -21,6 +21,7 @@ constexpr int ENGINE_CORE_ID = 1;
 constexpr int GATEWAY_CORE_1 = 2;
 constexpr int GATEWAY_CORE_2 = 3;
 constexpr int METRICS_CORE_ID = 3; // Shares core 3 with GATEWAY_CORE_2
+constexpr int ACK_CORE_ID = 0;     // AckThread — main thread's core, otherwise idle
 
 constexpr uint64_t TSC_CALIBRATION_MS = 50; // Duration for TSC frequency calibration
 } // namespace engine
@@ -36,9 +37,10 @@ constexpr uint64_t MID_PRICE_MIN = 500;   // Minimum mid price (clamp)
 constexpr uint64_t MID_PRICE_MAX = 1500;  // Maximum mid price (clamp)
 constexpr uint64_t AGGRESSIVE_OFFSET = 2; // Buys at mid+offset, sells at mid-offset
 
-// Default rate limit per client. 1700000 = sweet spot (6.8M/s total at sub-ms latency).
+// Default rate limit per client. 1400000 = sweet spot (cancel/ACK + maker fills):
+// 5.2M/s total at ~0.34ms P50 — last rate before the latency cliff at 1700k/client.
 // 0 = unlimited (max throughput, high latency).
-constexpr uint64_t DEFAULT_RATE_LIMIT = 1700000;
+constexpr uint64_t DEFAULT_RATE_LIMIT = 1400000;
 } // namespace load_gen
 
 } // namespace exchange::config

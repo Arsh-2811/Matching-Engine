@@ -7,11 +7,13 @@
 #include <csignal>
 #include <cstdio>
 #include <cstring>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <thread>
 #include <unistd.h>
+#include <unordered_map>
 #include <vector>
 
 using namespace exchange::network;
@@ -29,6 +31,12 @@ static constexpr uint32_t ORDER_DEFAULT_QTY = 10;
 static constexpr double UNLIMITED_TOKENS_PER_CYCLE = 1.0e18;
 static constexpr double NS_PER_SEC_DOUBLE = 1.0e9;
 static constexpr int TOKEN_BUCKET_BURST_MULTIPLIER = 4;
+static constexpr int CANCEL_INTERVAL = 10; // 10% cancel rate by new-order count
+
+// Wire size of an ACK message from the server.
+static constexpr std::size_t ACK_MSG_SIZE = sizeof(MsgHeader) + sizeof(AckMsg);
+// Large enough to absorb burst ACK data at unlimited send rates.
+static constexpr std::size_t RECV_BUF_CAPACITY = 1024 * 1024; // 1 MB
 
 // Simple token-bucket rate limiter.
 // tokens_per_cycle = target_orders_per_sec / tsc_frequency_hz
@@ -94,6 +102,140 @@ auto tl_rand() -> uint64_t {
 }
 } // namespace
 
+// Per-client recv buffer for parsing AckMsg responses.
+struct RecvBuffer {
+    char data[RECV_BUF_CAPACITY]{};
+    size_t read_idx{0};
+    size_t write_idx{0};
+
+    [[nodiscard]] auto pending_bytes() const -> size_t { return write_idx - read_idx; }
+    [[nodiscard]] auto available_space() const -> size_t { return RECV_BUF_CAPACITY - write_idx; }
+
+    void compact() {
+        if (read_idx > 0 && write_idx > read_idx) {
+            std::memmove(data, data + read_idx, write_idx - read_idx);
+            write_idx -= read_idx;
+            read_idx = 0;
+        } else if (read_idx == write_idx) {
+            read_idx = 0;
+            write_idx = 0;
+        }
+    }
+};
+
+// Live-order tracking:
+//   live_map  : exchange_order_id → {cl_ord_id, index_in_live_keys}
+//               O(1) lookup AND O(1) removal (index lets us swap-erase without scanning)
+//   live_keys : flat list of exchange_order_ids for O(1) random cancel pick
+//
+// Cap: at most LIVE_CAP resting orders tracked. Once full, new entries are
+// silently ignored. This prevents unbounded growth when maker fills arrive
+// without a corresponding fill-notification (makers currently emit no event).
+static constexpr std::size_t LIVE_CAP = 65536;
+
+static void erase_live(std::unordered_map<uint64_t, std::pair<uint64_t, std::size_t>> &live_map,
+                       std::vector<uint64_t> &live_keys, uint64_t eid) {
+    auto it = live_map.find(eid);
+    if (it == live_map.end()) {
+        return;
+    }
+    std::size_t idx = it->second.second; // index in live_keys
+    live_map.erase(it);
+
+    if (idx + 1 < live_keys.size()) {
+        // Swap with last element and update its index entry.
+        uint64_t last_eid = live_keys.back();
+        live_keys[idx] = last_eid;
+        live_map[last_eid].second = idx;
+    }
+    live_keys.pop_back();
+}
+
+static void insert_live(std::unordered_map<uint64_t, std::pair<uint64_t, std::size_t>> &live_map,
+                        std::vector<uint64_t> &live_keys, uint64_t eid, uint64_t cl_ord_id) {
+    if (live_keys.size() >= LIVE_CAP) {
+        return; // cap hit — discard entry to prevent unbounded growth
+    }
+    auto [it, inserted] = live_map.emplace(eid, std::make_pair(cl_ord_id, live_keys.size()));
+    (void)it;
+    if (inserted) {
+        live_keys.push_back(eid);
+    }
+}
+
+// Drain all available ACK messages from the socket (loops until EAGAIN).
+// live_map/live_keys are updated for each ACK received.
+static void drain_acks(int sock, RecvBuffer &rbuf,
+                       std::unordered_map<uint64_t, std::pair<uint64_t, std::size_t>> &live_map,
+                       std::vector<uint64_t> &live_keys, uint64_t &cancels_acked,
+                       uint64_t &cancel_rejects) {
+    // Loop recv() until EAGAIN so we drain the full kernel receive buffer.
+    while (true) {
+        if (rbuf.available_space() < ACK_MSG_SIZE) {
+            rbuf.compact();
+            if (rbuf.available_space() < ACK_MSG_SIZE) {
+                break; // buffer full even after compaction — parse what we have
+            }
+        }
+
+        ssize_t bytes_read =
+            recv(sock, rbuf.data + rbuf.write_idx, rbuf.available_space(), MSG_DONTWAIT);
+        if (bytes_read <= 0) {
+            break; // EAGAIN / EWOULDBLOCK or error — stop reading
+        }
+        rbuf.write_idx += static_cast<size_t>(bytes_read);
+
+        // Parse all complete ACK messages in the buffer.
+        while (rbuf.pending_bytes() >= ACK_MSG_SIZE) {
+            auto *hdr = reinterpret_cast<MsgHeader *>(rbuf.data + rbuf.read_idx);
+            if (hdr->type != MsgType::ORDER_ACK) {
+                size_t skip =
+                    (hdr->msg_size >= sizeof(MsgHeader) && rbuf.pending_bytes() >= hdr->msg_size)
+                        ? hdr->msg_size
+                        : 1;
+                rbuf.read_idx += skip;
+                continue;
+            }
+            if (rbuf.pending_bytes() < hdr->msg_size) {
+                break;
+            }
+
+            const auto *ack =
+                reinterpret_cast<const AckMsg *>(rbuf.data + rbuf.read_idx + sizeof(MsgHeader));
+            uint8_t event_type = ack->event_type;
+            uint64_t eid = ack->exchange_order_id;
+
+            // EventType: 0=NEW_ACK, 1=PARTIALLY_FILLED, 2=FILLED, 3=CANCELLED, 4=CANCEL_REJECTED,
+            // 5=MAKER_FILLED
+            if (event_type == 0 || event_type == 1) {
+                // NEW_ACK or PARTIALLY_FILLED (as taker) — order resting
+                insert_live(live_map, live_keys, eid, ack->cl_ord_id);
+            } else if (event_type == 2 || event_type == 3) {
+                // FILLED or CANCELLED — remove from live tracking
+                erase_live(live_map, live_keys, eid);
+                if (event_type == 3) {
+                    ++cancels_acked;
+                }
+            } else if (event_type == 4) {
+                // CANCEL_REJECTED
+                erase_live(live_map, live_keys, eid);
+                ++cancel_rejects;
+            } else if (event_type == 5) {
+                // MAKER_FILLED — resting order filled by an aggressor
+                // leaves_qty == 0: fully filled → remove from live tracking
+                // leaves_qty > 0: partially filled → still resting, update nothing
+                if (ack->leaves_qty == 0) {
+                    erase_live(live_map, live_keys, eid);
+                }
+            }
+
+            rbuf.read_idx += hdr->msg_size;
+        }
+    }
+
+    rbuf.compact();
+}
+
 static void run_client(int client_id, uint64_t target_rate_per_sec, double ns_per_cycle, int port) {
     tl_rng_seed();
     int sock = socket(AF_INET, SOCK_STREAM, 0);
@@ -135,6 +277,19 @@ static void run_client(int client_id, uint64_t target_rate_per_sec, double ns_pe
     // NOLINTNEXTLINE(modernize-avoid-c-arrays)
     char batch_buf[BATCH_BYTES];
 
+    RecvBuffer rbuf;
+    // O(1) lookup and O(1) removal: exchange_id → {cl_ord_id, index_in_live_keys}
+    std::unordered_map<uint64_t, std::pair<uint64_t, std::size_t>> live_map;
+    live_map.reserve(LIVE_CAP);
+    // Flat list for O(1) random pick when selecting an order to cancel.
+    std::vector<uint64_t> live_keys;
+    live_keys.reserve(LIVE_CAP);
+
+    uint64_t cancels_sent = 0;
+    uint64_t cancels_acked = 0;
+    uint64_t cancel_rejects = 0;
+    int cancel_counter = 0;
+
     while (keep_running.load(std::memory_order_relaxed)) {
         if (!bucket.try_consume()) {
             CPU_PAUSE();
@@ -147,6 +302,27 @@ static void run_client(int client_id, uint64_t target_rate_per_sec, double ns_pe
             ++mid_price;
         } else if (delta < 0 && mid_price > load_gen::MID_PRICE_MIN) {
             --mid_price;
+        }
+
+        // Maybe send a cancel before the new-order batch (10% cancel rate).
+        if (cancel_counter >= CANCEL_INTERVAL && !live_keys.empty()) {
+            uint64_t cancel_eid = live_keys[static_cast<size_t>(tl_rand() % live_keys.size())];
+
+            // NOLINTNEXTLINE(modernize-avoid-c-arrays)
+            char cancel_buf[SINGLE_MSG_SIZE];
+            MsgHeader chdr{static_cast<uint16_t>(SINGLE_MSG_SIZE), MsgType::CANCEL_ORDER};
+            SbeOrder corder{.order_id = cancel_eid,
+                            .price = 0,
+                            .quantity = 0,
+                            .side = 0,
+                            .type = 1, // CANCEL
+                            .timestamp_tsc = rdtsc()};
+            std::memcpy(cancel_buf, &chdr, sizeof(chdr));
+            std::memcpy(cancel_buf + sizeof(chdr), &corder, sizeof(corder));
+            send(sock, cancel_buf, SINGLE_MSG_SIZE, 0);
+
+            ++cancels_sent;
+            cancel_counter = 0;
         }
 
         for (int idx = 0; idx < load_gen::BATCH_SIZE; ++idx) {
@@ -179,7 +355,17 @@ static void run_client(int client_id, uint64_t target_rate_per_sec, double ns_pe
         if (send(sock, batch_buf, BATCH_BYTES, 0) < 0) {
             break;
         }
+
+        ++cancel_counter;
+
+        // Drain ACKs non-blocking (loops until EAGAIN) — don't stall the send loop.
+        drain_acks(sock, rbuf, live_map, live_keys, cancels_acked, cancel_rejects);
     }
+
+    std::fprintf(stderr, "Client %d: cancels_sent=%llu cancels_acked=%llu cancel_rejects=%llu\n",
+                 client_id, static_cast<unsigned long long>(cancels_sent),
+                 static_cast<unsigned long long>(cancels_acked),
+                 static_cast<unsigned long long>(cancel_rejects));
 
     close(sock);
 }

@@ -26,7 +26,7 @@ class MarketDataThread {
         uint64_t seq = 0;
         while (is_running_.load(std::memory_order_acquire)) {
             OutboundEvent event;
-            if (!outbound_.pop(consumer_id_, event)) {
+            if (!outbound_.pop_best_effort(consumer_id_, event)) {
                 std::this_thread::yield();
                 continue;
             }
@@ -42,7 +42,8 @@ class MarketDataThread {
   public:
     explicit MarketDataThread(queue::SpmcBroadcastQueue<OutboundEvent> &outbound)
         : outbound_(outbound) {
-        consumer_id_ = outbound_.register_consumer();
+        // Best-effort: stub consumer — never blocks the engine producer.
+        consumer_id_ = outbound_.register_best_effort_consumer();
     }
 
     MarketDataThread(const MarketDataThread &) = delete;

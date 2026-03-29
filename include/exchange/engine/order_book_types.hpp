@@ -11,6 +11,10 @@ struct PriceLevel;
 // prev_idx / next_idx are uint32_t offsets into the slab rather than raw
 // pointers, halving the per-node pointer footprint and improving cache density.
 // NULL_IDX (UINT32_MAX) is the sentinel for "no neighbour".
+//
+// Kept at exactly 32 bytes so two nodes fit per 64-byte cache line.
+// Cold routing data (cl_ord_id, client_fd) lives in a parallel sidecar array
+// in OrderBook, indexed by the same pool slot index.
 struct OrderNode {
     static constexpr uint32_t NULL_IDX = std::numeric_limits<uint32_t>::max();
 
@@ -30,7 +34,7 @@ struct OrderNode {
         next_idx = NULL_IDX;
     }
 };
-// OrderNode is 32 bytes: fits 2 per 64-byte cache line (vs 1 previously).
+// OrderNode is 32 bytes: two nodes fit per 64-byte cache line.
 
 // PriceLevel stores the doubly-linked list as slab indices rather than
 // pointers, shrinking from 32 bytes to 24 bytes per level entry.

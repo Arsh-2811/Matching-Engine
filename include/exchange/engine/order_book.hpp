@@ -8,12 +8,21 @@
 #include <cstddef>
 #include <cstdint>
 #include <sys/types.h>
+#include <vector>
 
 namespace exchange::engine {
 class OrderBook {
   private:
     MemoryPool<OrderNode> node_pool_;
     OrderLookup order_lookup_;
+
+    // Cold routing data parallel to node_pool_ — indexed by pool slot index.
+    // Kept separate so the 32-byte hot OrderNode stays 2-per-cache-line.
+    struct NodeRouting {
+        uint64_t cl_ord_id{0};
+        int client_fd{-1};
+    };
+    std::vector<NodeRouting> node_routing_;
 
     PriceLevelIndex bids_;
     PriceLevelIndex asks_;
@@ -64,7 +73,7 @@ class OrderBook {
     }
 
     // Returns the total quantity matched during this fill sweep.
-    auto match_buy(Order &taker) -> uint32_t {
+    auto match_buy(Order &taker, MakerFillBuffer *fills) -> uint32_t {
         uint32_t total_matched = 0;
         for (uint64_t price = lowest_ask_; price <= taker.price; price += tick_size_) {
             PriceLevel *level = asks_.get_level(price);
@@ -91,6 +100,15 @@ class OrderBook {
                 level->total_quantity -= trade_qty;
 
                 if (maker.quantity == 0) {
+                    if (fills != nullptr && fills->count < MAX_MAKER_FILLS) {
+                        const auto &routing = node_routing_[maker_idx];
+                        auto &fill = fills->fills[fills->count++];
+                        fill.order_id = maker.order_id;
+                        fill.cl_ord_id = routing.cl_ord_id;
+                        fill.client_fd = routing.client_fd;
+                        fill.matched_qty = trade_qty;
+                        fill.leaves_qty = 0;
+                    }
                     uint32_t next_idx = maker.next_idx;
                     // Matching always consumes from the head — fast-path unlink.
                     level->head_idx = next_idx;
@@ -105,6 +123,15 @@ class OrderBook {
                     node_pool_.deallocate(&maker);
                     maker_idx = next_idx;
                 } else {
+                    if (fills != nullptr && fills->count < MAX_MAKER_FILLS) {
+                        const auto &routing = node_routing_[maker_idx];
+                        auto &fill = fills->fills[fills->count++];
+                        fill.order_id = maker.order_id;
+                        fill.cl_ord_id = routing.cl_ord_id;
+                        fill.client_fd = routing.client_fd;
+                        fill.matched_qty = trade_qty;
+                        fill.leaves_qty = maker.quantity;
+                    }
                     break;
                 }
             }
@@ -121,7 +148,7 @@ class OrderBook {
     }
 
     // Returns the total quantity matched during this fill sweep.
-    auto match_sell(Order &taker) -> uint32_t {
+    auto match_sell(Order &taker, MakerFillBuffer *fills) -> uint32_t {
         uint32_t total_matched = 0;
         for (uint64_t price = highest_bid_; price >= taker.price; price -= tick_size_) {
             PriceLevel *level = bids_.get_level(price);
@@ -151,6 +178,15 @@ class OrderBook {
                 level->total_quantity -= trade_qty;
 
                 if (maker.quantity == 0) {
+                    if (fills != nullptr && fills->count < MAX_MAKER_FILLS) {
+                        const auto &routing = node_routing_[maker_idx];
+                        auto &fill = fills->fills[fills->count++];
+                        fill.order_id = maker.order_id;
+                        fill.cl_ord_id = routing.cl_ord_id;
+                        fill.client_fd = routing.client_fd;
+                        fill.matched_qty = trade_qty;
+                        fill.leaves_qty = 0;
+                    }
                     uint32_t next_idx = maker.next_idx;
                     // Matching always consumes from the head — fast-path unlink.
                     level->head_idx = next_idx;
@@ -165,6 +201,15 @@ class OrderBook {
                     node_pool_.deallocate(&maker);
                     maker_idx = next_idx;
                 } else {
+                    if (fills != nullptr && fills->count < MAX_MAKER_FILLS) {
+                        const auto &routing = node_routing_[maker_idx];
+                        auto &fill = fills->fills[fills->count++];
+                        fill.order_id = maker.order_id;
+                        fill.cl_ord_id = routing.cl_ord_id;
+                        fill.client_fd = routing.client_fd;
+                        fill.matched_qty = trade_qty;
+                        fill.leaves_qty = maker.quantity;
+                    }
                     break;
                 }
             }
@@ -180,9 +225,9 @@ class OrderBook {
         return total_matched;
     }
 
-    // Returns total matched quantity (0 for a fully resting order).
-    auto on_new_order(Order &order) -> uint32_t {
-        uint32_t matched = 0;
+    // Returns ProcessResult describing how the new order was resolved.
+    auto on_new_order(Order &order, MakerFillBuffer *fills) -> ProcessResult {
+        uint32_t original_qty = order.quantity;
 
         // FOK: check available liquidity BEFORE touching the book.
         if (order.type == OrderType::FOK) {
@@ -208,32 +253,40 @@ class OrderBook {
                 }
             }
             if (avail < order.quantity) {
-                return 0; // insufficient liquidity, cancel FOK
+                return {0, 0, EventType::CANCELLED}; // insufficient liquidity, cancel FOK
             }
         }
 
+        uint32_t matched = 0;
         if (order.side == Side::BUY) {
-            matched = match_buy(order);
+            matched = match_buy(order, fills);
         } else {
-            matched = match_sell(order);
+            matched = match_sell(order, fills);
         }
 
         // IOC/FOK: discard remainder (never rest)
         if (order.type == OrderType::IOC || order.type == OrderType::FOK) {
-            return matched;
+            EventType et = (matched > 0) ? EventType::FILLED : EventType::CANCELLED;
+            return {matched, 0, et};
         }
 
-        if (order.quantity == 0) {
-            return matched;
+        uint32_t leaves = order.quantity; // remaining after matching
+
+        if (leaves == 0) {
+            return {matched, 0, EventType::FILLED};
         }
 
         OrderNode *node = node_pool_.allocate();
         if (node == nullptr) {
-            return matched; // In a real system, we would trigger a critical halt here
+            // In a real system, we would trigger a critical halt here
+            EventType et = (matched > 0) ? EventType::PARTIALLY_FILLED : EventType::NEW_ACK;
+            return {matched, leaves, et};
         }
         node->order_id = order.order_id;
         node->quantity = order.quantity;
         node->side = order.side;
+        const uint32_t node_idx = node_pool_.index_of(node);
+        node_routing_[node_idx] = {order.cl_ord_id, order.client_fd};
 
         PriceLevel *level = nullptr;
         if (order.side == Side::BUY) {
@@ -252,19 +305,32 @@ class OrderBook {
 
         if (level == nullptr) {
             node_pool_.deallocate(node);
-            return matched;
+            EventType et = (matched > 0) ? EventType::PARTIALLY_FILLED : EventType::NEW_ACK;
+            return {matched, leaves, et};
         }
 
         order_lookup_.add_order(order.order_id, node_pool_.index_of(node));
-        return matched;
+
+        // Determine event type based on fill result
+        EventType et;
+        if (matched > 0 && leaves > 0) {
+            et = EventType::PARTIALLY_FILLED;
+        } else if (matched == 0) {
+            et = EventType::NEW_ACK;
+        } else {
+            et = EventType::FILLED; // matched > 0 && leaves == 0 (handled above, but be safe)
+        }
+        (void)original_qty; // suppress unused warning
+        return {matched, leaves, et};
     }
 
-    void on_cancel_order(const Order &order) {
+    auto on_cancel_order(const Order &order) -> ProcessResult {
         uint32_t idx = order_lookup_.get_order(order.order_id);
         if (idx == OrderNode::NULL_IDX) {
-            return;
+            return {0, 0, EventType::CANCEL_REJECTED};
         }
         OrderNode &node = node_pool_.get(idx);
+        uint32_t cancelled_qty = node.quantity;
         PriceLevel *level = node.price_level;
         if (level != nullptr) {
             level->total_quantity -= node.quantity;
@@ -273,35 +339,41 @@ class OrderBook {
         order_lookup_.remove_order(order.order_id);
         node.reset();
         node_pool_.deallocate(&node);
+        return {0, cancelled_qty, EventType::CANCELLED};
     }
 
   public:
     OrderBook(std::size_t max_orders, uint64_t min_price, uint64_t max_price, uint64_t tick_size)
-        : node_pool_(max_orders), order_lookup_(max_orders), bids_(min_price, max_price, tick_size),
-          asks_(min_price, max_price, tick_size), min_price_(min_price), max_price_(max_price),
-          tick_size_(tick_size), highest_bid_(min_price), lowest_ask_(max_price) {}
+        : node_pool_(max_orders), order_lookup_(max_orders), node_routing_(max_orders),
+          bids_(min_price, max_price, tick_size), asks_(min_price, max_price, tick_size),
+          min_price_(min_price), max_price_(max_price), tick_size_(tick_size),
+          highest_bid_(min_price), lowest_ask_(max_price) {}
 
     OrderBook(const OrderBook &) = delete;
     OrderBook &operator=(const OrderBook &) = delete;
 
-    // Returns total quantity matched for this order (0 for fully resting orders).
-    auto process_order(const Order &incoming_order) -> uint32_t {
+    // Returns ProcessResult describing how the order was resolved.
+    auto process_order(const Order &incoming_order,
+                       MakerFillBuffer *fills = nullptr) -> ProcessResult {
+        if (fills)
+            fills->clear();
         Order order = incoming_order;
         switch (order.type) {
         case OrderType::NEW:
-            return on_new_order(order);
+            return on_new_order(order, fills);
         case OrderType::CANCEL:
-            on_cancel_order(order);
-            return 0;
-        case OrderType::MODIFY:
-            on_cancel_order(order);
-            return on_new_order(order);
-        case OrderType::IOC:
-            return on_new_order(order);
-        case OrderType::FOK:
-            return on_new_order(order);
+            return on_cancel_order(order);
+        case OrderType::MODIFY: {
+            on_cancel_order(order); // ignore cancel result for modify
+            return on_new_order(order, fills);
         }
-        return 0;
+        case OrderType::IOC:
+            return on_new_order(order, fills);
+        case OrderType::FOK:
+            return on_new_order(order, fills);
+        default:
+            return {0, 0, EventType::CANCELLED};
+        }
     }
 
     // Public getters for testing and asserting state

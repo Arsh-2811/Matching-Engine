@@ -86,6 +86,8 @@ TEST(MemoryPoolTest, GetByIndexRoundTrips) {
 }
 
 TEST(MemoryPoolTest, NodeSizeIs32Bytes) {
-    // Verifies the uint32_t-index layout achieves the expected cache density.
+    // OrderNode is 32 bytes: hot matching fields only (order_id, quantity,
+    // side, price_level*, prev_idx, next_idx). Cold routing data (cl_ord_id,
+    // client_fd) lives in a parallel sidecar array in OrderBook.
     EXPECT_EQ(sizeof(OrderNode), 32U);
 }
