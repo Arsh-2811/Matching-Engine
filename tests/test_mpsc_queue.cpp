@@ -142,7 +142,7 @@ TEST(MpscQueueBenchmark, Throughput) {
             if (queue.pop(item)) {
                 items_consumed.fetch_add(1, std::memory_order_relaxed);
             } else {
-                CPU_PAUSE();
+                std::this_thread::yield();
             }
         }
     });
@@ -156,7 +156,7 @@ TEST(MpscQueueBenchmark, Throughput) {
 
             for (std::size_t j = 0; j < MESSAGES_PER_PRODUCER; ++j) {
                 while (!queue.push(1)) {
-                    CPU_PAUSE();
+                    std::this_thread::yield();
                 }
             }
         });
