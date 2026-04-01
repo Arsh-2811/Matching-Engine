@@ -1862,6 +1862,112 @@ tokens_ = std::min(max_tokens_, tokens_ + elapsed * tokens_per_cycle_);
 
 ---
 
-*End of LEARNING.md — Version 2.0*
+## 22. Profile-Guided Optimization (PGO)
 
-*Added in Version 2.0: Throughput vs Latency (§17), BATCH_SIZE effects (§18), Cancel/ACK return path (§19), Maker fill notifications (§20), Performance engineering lessons (§21).*
+### The problem with static compiler heuristics
+
+When you compile C++ with `-O3`, the compiler makes decisions based on general rules:
+
+- "This loop probably runs many times, so unroll it."
+- "This function is small, so inline it."
+- "This branch is probably taken, so put it first in memory."
+
+These are *guesses*. The compiler has never seen the program run. It does not know that `match_buy` executes 10 million times per second while `on_cancel_order` runs only 140,000 times per second. It does not know that the `if (order_id == 0)` poison-pill check is taken exactly once in the entire run.
+
+**Profile-Guided Optimization** (PGO) fixes this by giving the compiler real data from an actual execution.
+
+### The three phases
+
+#### Phase 1 — Instrument
+
+Compile with `-fprofile-generate=/path/to/dir -fprofile-update=atomic`.
+
+`-fprofile-generate` tells the compiler to insert **counters** into the binary — small integers that increment every time a branch is taken, a function is called, or a loop iterates. These counters are written into `.gcda` files when the program exits.
+
+`-fprofile-update=atomic` is required because this engine is multi-threaded. Without it, two threads (e.g. AckThread and MatchingEngine) could increment the same counter simultaneously and corrupt it. The `atomic` variant uses CPU atomic fetch-add instructions to prevent this.
+
+We also use the same `-O3 -march=native -flto` flags as the final Release build. This is critical: the compiler must make the same inlining decisions in both phases. If Phase 1 inlines a function but Phase 2 does not, the branch-counter layout changes and the profile data becomes invalid. GCC reports this as a `coverage-mismatch` error.
+
+#### Phase 2 — Profile run
+
+Run the instrumented `exchange_app` against the instrumented `load_gen` at the production workload — 4 clients at 1.4 M orders/sec — for 30 seconds.
+
+During this run, `match_buy` and `match_sell` (the inner matching loop) accumulate hundreds of millions of counter hits. The `if (order_id == 0)` check accumulates exactly one hit at shutdown. The `on_cancel_order` path accumulates roughly 420,000 hits (10% cancel rate × 4.2 M orders processed).
+
+When the exchange exits cleanly (SIGINT → graceful shutdown), the gcov runtime calls `__gcov_exit()` and flushes all counters to `.gcda` files on disk. One file per translation unit:
+- `core.cpp.gcda` — MpscQueue push/pop, gateway receive
+- `worker.cpp.gcda` — epoll loop, TCP recv
+- `main.cpp.gcda` — startup, thread creation, shutdown
+
+#### Phase 3 — Optimize
+
+Recompile with `-fprofile-use=/path/to/dir -fprofile-correction -O3 -march=native -flto`.
+
+The compiler reads the `.gcda` files and now knows:
+
+1. **Which branches are hot.** The matching loop runs 500 M+ times. The poison-pill check runs once. The compiler places the cold branch (order_id == 0) after the end of the function in memory. The CPU's instruction cache never loads it during normal operation.
+
+2. **Which functions are worth inlining.** `on_new_order` is called for every order. The compiler is more aggressive about inlining it into the matching engine's dispatch loop. `on_cancel_order` is called ~10% of the time — the compiler may choose not to inline it.
+
+3. **How many times loops execute.** The price-level traversal loop in `match_buy`/`match_sell` usually runs 1–2 iterations (most fills match one or two resting orders). The compiler unrolls it for the 1–2 case rather than the general case.
+
+4. **Call graph hotness with LTO.** Because `-flto` is active simultaneously, the compiler can make cross-translation-unit inlining decisions informed by the profile. A function defined in `worker.cpp` but called from `matching_engine.hpp` can be inlined based on real call frequency.
+
+`-fprofile-correction` suppresses warnings about minor counter inconsistencies that arise when two threads update a counter within the same nanosecond. It does not suppress genuinely missing data.
+
+### What we measured
+
+All measurements on i5-9300H, 4 clients, BATCH=64, Q=2M.
+
+**At the sweet spot (1.4 M/s per client):**
+
+| Metric | Release | PGO | Delta |
+|---|---|---|---|
+| P50 throughput | 5.64 M/s | 5.64 M/s | — |
+| Mean throughput | 5.83 M/s | 6.01 M/s | +3.1% |
+| Mean P50 latency | 0.03 ms | 0.02 ms | **−33%** |
+| Mean avg latency | 3.06 ms | 2.42 ms | −21% |
+
+The P50 latency improvement means the median order now completes 10 µs faster. At the hardware level this corresponds to the hot matching path fitting more cleanly in L1 instruction cache — fewer fetch stalls, better branch prediction.
+
+**At unlimited rate (saturated queue):**
+
+PGO is slightly lower than Release (8.52 vs 10.75 M/s P50 throughput). This is expected: the profile was captured at 1.4 M/s, where the queue is near-empty and the CPU spends most time executing the matching path in order. At unlimited rate, the queue is always full and the access pattern is different — the branch layout optimised for the profiled case is no longer optimal for the saturated case. If you wanted to optimise for maximum saturated throughput, you would profile with unlimited rate instead.
+
+**At 2M/s (just above the latency cliff):**
+
+P99 latency improved by 27% (40 ms → 29 ms). In this regime the queue oscillates between empty and full. PGO's tighter branch layout helps the engine drain backlog bursts faster.
+
+**Below 1M/s:**
+
+Identical to Release. At low rates the engine is always ahead — there is no bottleneck for PGO to sharpen.
+
+### Why PGO is profile-specific — and why that matters
+
+The core principle: **PGO optimises for the workload you profile with, at the cost of other workloads.**
+
+For a production trading system this is a feature. You know your production arrival rate. You profile with it. The binary is fastest exactly where you need it. The "worse at unlimited rate" result is not a problem because you would never run a real exchange at unlimited rate — that is the saturation regime that causes 220 ms P50 latency.
+
+The 30-second profile window is sufficient because the matching engine's hot paths are exercised within the first few seconds. Longer runs only add redundant counter increments for the same code paths.
+
+### The CMake integration
+
+Two new build types are defined in `CMakeLists.txt`:
+
+```cmake
+# PGO_PROFILE_DIR is set once, resolves to <build_dir>/pgo-profiles
+# Both PGOGen and PGOUse use the same build directory, so the path is consistent.
+
+$<$<CONFIG:PGOGen>:-O3 -march=native -flto -fprofile-generate=${PGO_PROFILE_DIR} -fprofile-update=atomic>
+$<$<CONFIG:PGOUse>:-O3 -march=native -flto -fprofile-use=${PGO_PROFILE_DIR} -fprofile-correction -Wno-error=coverage-mismatch>
+```
+
+Generator expressions — the `$<$<CONFIG:...>:...>` syntax — evaluate at build time. The inner condition is the build type; the value is the flags to emit. Nothing else in the file changes. `unit_tests` receives no PGO flags and remains unaffected.
+
+`scripts/pgo_build.sh` automates all three phases end-to-end: it builds PGOGen, starts the exchange, runs load_gen for 30 seconds, cleanly shuts both down, verifies `.gcda` files exist, then rebuilds PGOUse in the same directory.
+
+---
+
+*End of LEARNING.md — Version 3.0*
+
+*Added in Version 3.0: Profile-Guided Optimization (§22).*

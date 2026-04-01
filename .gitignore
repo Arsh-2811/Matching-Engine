@@ -1,4 +1,5 @@
 build/
+build_pgo/
 compile_commands.json
 .cache/
 codebase_context.txt

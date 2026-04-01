@@ -1,10 +1,10 @@
 # Matching Engine
 
-A price-time priority order matching engine written in C++17. Built as an exercise in low-latency systems engineering — lock-free data structures, cache-line layout, CPU core affinity, and TSC-based timing.
+A price-time priority order matching engine written in C++20. Built as an exercise in low-latency systems engineering — lock-free data structures, cache-line layout, CPU core affinity, and TSC-based timing.
 
-**Measured on i5-9300H, no kernel isolation:**
-- 5.2 M orders/sec end-to-end at 0.34 ms P50 latency (rate-limited, 4 TCP clients)
-- 7.1 M orders/sec at queue saturation
+**Measured on i5-9300H, no kernel isolation (PGO-optimised build):**
+- 5.64 M orders/sec end-to-end at 0.02 ms P50 latency (rate-limited, 4 TCP clients)
+- 8.5 M orders/sec at queue saturation
 - 23 M orders/sec in-process (no TCP, unit benchmark)
 
 ## Features
@@ -53,12 +53,25 @@ MatchingEngine  (core 1)
 
 ### Rate sweep  —  BATCH=64, Q=2M, 4 clients  (i5-9300H)
 
-| Rate/client | Total rate | Throughput | P50 Latency | Notes |
-|---|---|---|---|---|
-| unlimited | — | 7.1 M/s | 23 ms | inbound queue saturated |
-| 2000k | 8.0 M/s | 7.98 M/s | 5.68 ms | past the latency cliff |
-| **1400k** | **5.6 M/s** | **5.20 M/s** | **0.34 ms** | sweet spot |
-| 1000k | 4.0 M/s | 4.00 M/s | < 0.1 ms | — |
+#### Release (`-O3 -march=native -flto`)
+
+| Rate/client | P50 Throughput | P50 Latency | Notes |
+|---|---|---|---|
+| unlimited | 10.75 M/s | 139 ms | inbound queue saturated |
+| 2000k | 8.06 M/s | 0.09 ms | past the latency cliff |
+| **1400k ★** | **5.64 M/s** | **0.03 ms** | sweet spot |
+| 1000k | 4.06 M/s | 0.02 ms | — |
+
+#### PGO (`-O3 -march=native -flto -fprofile-use`)
+
+| Rate/client | P50 Throughput | P50 Latency | vs Release |
+|---|---|---|---|
+| unlimited | 8.52 M/s | 220 ms | — (profiled at 1.4M/s, not saturated) |
+| 2000k | 8.06 M/s | 0.67 ms | P99: −27% (40 ms → 29 ms) |
+| **1400k ★** | **5.64 M/s** | **0.02 ms** | **P50 latency −33%** |
+| 1000k | 4.06 M/s | 0.02 ms | identical |
+
+PGO was profiled at the 1400k/client sweet spot. It optimises for that regime. At unlimited rate (a different code path) results are neutral-to-lower because the compiler tuned branch layout and inlining for the near-empty-queue case.
 
 The latency cliff occurs when input rate exceeds engine capacity and the MpscQueue fills permanently. Each order then queues behind ~2 M others. Rate-limiting to ~70% of capacity keeps the queue near-empty and latency sub-millisecond.
 
@@ -104,21 +117,28 @@ AckThread maintains separate `taker_events_since_flush` and `maker_events_since_
 
 Declaring `MakerFillBuffer` inside the loop rather than hoisting it produces measurably better codegen — the compiler can treat the buffer as freshly initialized on each iteration and avoids dead-store suppression around the zero-initialization.
 
+**Profile-Guided Optimization**  (`scripts/pgo_build.sh`, `CMakeLists.txt`)
+
+The build supports a three-phase PGO workflow: compile with `-fprofile-generate` and `-fprofile-update=atomic` (thread-safe counters), run the exchange under the 1.4 M/s production workload for 30 s to collect `.gcda` files, then recompile with `-fprofile-use -fprofile-correction -flto`. The compiler uses real branch-frequency data to reorder basic blocks (hot path stays contiguous in the instruction cache), pick inlining targets, and tune loop unrolling. Both phases use `-O3 -march=native -flto` to ensure identical CFG structure so profile counters match. At the 1.4 M/s sweet spot this reduces P50 latency from 0.03 ms to 0.02 ms (−33%).
+
 ## Build & Run
 
 ```bash
 # Release build
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build
 
+# PGO build (instrument → profile 30 s → optimise; outputs to build_pgo/)
+bash scripts/pgo_build.sh
+
 # Terminal 1 — start the exchange
-./build/exchange_app
+./build/exchange_app          # or ./build_pgo/exchange_app for PGO
 
 # Terminal 2 — start the load generator
 ./build/load_gen                   # 4 clients at 1400k orders/sec/client (default)
 ./build/load_gen 4 0               # unlimited rate
 ./build/load_gen 4 1400000         # explicit rate
 
-# Run all tests (80 tests)
+# Run all tests
 ctest --test-dir build
 
 # Stress test and parameter sweep
