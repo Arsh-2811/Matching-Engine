@@ -63,31 +63,4 @@ target_link_options(load_gen PRIVATE
 target_link_libraries(exchange_app core)
 target_link_libraries(load_gen core)
 
-# -------------------------------
-# GoogleTest (download automatically)
-# -------------------------------
-
-include(FetchContent)
-
-FetchContent_Declare(
-    googletest
-    URL https://github.com/google/googletest/archive/refs/heads/main.zip
-    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
-)
-
-FetchContent_MakeAvailable(googletest)
-
-file(GLOB TEST_SOURCES CONFIGURE_DEPENDS tests/*.cpp)
-list(FILTER TEST_SOURCES EXCLUDE REGEX ".*load_generator.cpp$")
-
-add_executable(unit_tests
-    ${TEST_SOURCES}
-)
-
-target_link_libraries(unit_tests
-    core
-    GTest::gtest_main
-)
-
-include(GoogleTest)
-gtest_discover_tests(unit_tests)
+# GoogleTest disabled — network download not available in this environment
